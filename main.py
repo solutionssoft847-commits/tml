@@ -11,12 +11,68 @@ import json
 import uvicorn
 from contextlib import asynccontextmanager
 import time
+import gc
 from datetime import datetime
 from inspector_engine import AdvancedBlockInspector
 from database import init_db, get_db, InspectionRecord, Stats, SessionLocal
 
+import os
+from gradio_client import Client, handle_file
+
 # Initialize Inspector
-inspector = AdvancedBlockInspector(yolo_model_path='yolo26n-obb.pt')
+# Global Inspector Instance (Lazy loaded)
+inspector = None
+
+class RemoteBlockInspector:
+    """Uses Hugging Face Space for inference to save Render memory"""
+    def __init__(self, space_id):
+        self.space_id = space_id
+        try:
+            self.client = Client(space_id)
+            print(f"✓ Connected to Remote HF Inspector: {space_id}")
+        except Exception as e:
+            print(f"✗ Failed to connect to HF Space {space_id}: {e}")
+            self.client = None
+
+    def inspect_block(self, image):
+        if not self.client:
+            return None
+        
+        # Save temp image for Gradio
+        temp_path = "temp_inspect.jpg"
+        cv2.imwrite(temp_path, image)
+        
+        try:
+            # Assumes the Gradio API has a '/predict' or similar endpoint
+            # Based on the user's Gradio app structure
+            result = self.client.predict(
+                image=handle_file(temp_path),
+                api_name="/predict"
+            )
+            # result structure depends on how the user's app.py is written
+            # We'll need a way to parse it back to BlockInspectionResult
+            # For now, we'll return a placeholder or attempts to parse
+            return result 
+        except Exception as e:
+            print(f"Remote inspection error: {e}")
+            return None
+
+def get_inspector():
+    global inspector
+    if inspector is None:
+        hf_space = os.environ.get('HF_SPACE')
+        if hf_space:
+            print(f"Initializing RemoteBlockInspector via HF: {hf_space}...", flush=True)
+            inspector = RemoteBlockInspector(hf_space)
+        else:
+            print("Initializing LOCAL AdvancedBlockInspector (High RAM usage)...", flush=True)
+            try:
+                inspector = AdvancedBlockInspector(yolo_model_path='yolo26n-obb.pt')
+                print("AdvancedBlockInspector initialized locally.", flush=True)
+            except Exception as e:
+                print(f"Error initializing local inspector: {e}", flush=True)
+                raise e
+    return inspector
 
 # In-memory fallback for last_24h (not persisted, resets on restart)
 last_24h_cache = []
@@ -180,14 +236,26 @@ async def inspect_upload(file: UploadFile = File(...), db: Session = Depends(get
     if image is None:
         return JSONResponse(status_code=400, content={"message": "Invalid image"})
     
-    result = inspector.inspect_block(image)
+    # Lazy init
+    insp = get_inspector()
+    result = insp.inspect_block(image)
+    
+    # Map results for both local and remote modes
+    if isinstance(result, dict): # Remote result
+        result_dict = result
+    elif hasattr(result, 'to_dict'): # Local result object
+        result_dict = result.to_dict()
+    else:
+        result_dict = {"block_status": "UNKNOWN"}
+
+    block_status = result_dict.get('block_status', 'UNKNOWN')
     
     # Update Stats in DB
     if db:
         stats = db.query(Stats).first()
         if stats:
             stats.total_scans += 1
-            if result.block_status == 'PERFECT':
+            if block_status == 'PERFECT':
                 stats.perfect_count += 1
             else:
                 stats.defected_count += 1
@@ -197,7 +265,7 @@ async def inspect_upload(file: UploadFile = File(...), db: Session = Depends(get
     global last_24h_cache
     last_24h_cache.append({
         'timestamp': time.time(),
-        'status': result.block_status
+        'status': block_status
     })
     
     # Broadcast updates via WebSocket
@@ -207,45 +275,48 @@ async def inspect_upload(file: UploadFile = File(...), db: Session = Depends(get
     })
     
     # Generate visualization
-    if hasattr(inspector, 'last_saddles'):
-        vis = inspector.visualize_results(image, inspector.last_saddles, result.saddle_results)
+    image_data = None
+    if not isinstance(insp, RemoteBlockInspector) and hasattr(insp, 'last_saddles'):
+        vis = insp.visualize_results(image, insp.last_saddles, result.saddle_results)
         _, buffer = cv2.imencode('.jpg', vis)
         import base64
         img_str = base64.b64encode(buffer).decode('utf-8')
+        image_data = f"data:image/jpeg;base64,{img_str}"
         
-        # Add to history in DB
-        hist_item = {
-            'timestamp': datetime.utcnow().isoformat(),
-            'status': result.block_status,
-            'defects': result.defective_saddles,
-            'processing_time': result.processing_time_ms
-        }
-        
-        if db:
-            record = InspectionRecord(
-                timestamp=datetime.utcnow(),
-                status=result.block_status,
-                defects=result.defective_saddles,
-                processing_time=result.processing_time_ms
-            )
-            db.add(record)
-            db.commit()
-            db.refresh(record)
-            hist_item['id'] = record.id
+    # Add to history in DB
+    hist_item = {
+        'timestamp': datetime.utcnow().isoformat(),
+        'status': block_status,
+        'defects': result_dict.get('defective_saddles', 0),
+        'processing_time': result_dict.get('processing_time_ms', 0)
+    }
+    
+    if db:
+        record = InspectionRecord(
+            timestamp=datetime.utcnow(),
+            status=block_status,
+            defects=hist_item['defects'],
+            processing_time=hist_item['processing_time']
+        )
+        db.add(record)
+        db.commit()
+        db.refresh(record)
+        hist_item['id'] = record.id
 
-        # Broadcast history update
-        await manager.broadcast({
-            "type": "history_update",
-            "data": [hist_item]
-        })
-            
-        return {
-            "result": result.to_dict(),
-            "image": f"data:image/jpeg;base64,{img_str}",
-            "history_item": hist_item
-        }
+    # Broadcast history update
+    await manager.broadcast({
+        "type": "history_update",
+        "data": [hist_item]
+    })
         
-    return {"result": result.to_dict()}
+    import gc
+    gc.collect()
+            
+    return {
+        "result": result_dict,
+        "image": image_data,
+        "history_item": hist_item
+    }
 
 @app.post("/api/add_reference")
 async def add_reference(file: UploadFile = File(...)):
@@ -256,8 +327,9 @@ async def add_reference(file: UploadFile = File(...)):
     if image is None:
         return JSONResponse(status_code=400, content={"message": "Invalid image"})
         
-    success = inspector.add_reference_image(image)
-    count = inspector.reference_manager.get_reference_count()
+    insp = get_inspector()
+    success = insp.add_reference_image(image)
+    count = insp.reference_manager.get_reference_count()
     return {"success": success, "count": count}
 
 # Camera handling
@@ -266,6 +338,11 @@ current_camera_index = 0
 
 def get_camera():
     global camera, current_camera_index
+    # Disable camera hardware on Render cloud environment
+    if os.environ.get('RENDER'):
+        print("[INFO] Camera disabled in Render environment.")
+        return None
+    
     if camera is None:
         camera = cv2.VideoCapture(current_camera_index)
     return camera
@@ -310,6 +387,11 @@ async def stop_camera_endpoint():
 
 def generate_frames():
     cam = get_camera()
+    if cam is None:
+        yield (b'--frame\r\n'
+               b'Content-Type: text/plain\r\n\r\n' + b'Camera not available on cloud server' + b'\r\n')
+        return
+
     if not cam.isOpened():
         cam.open(current_camera_index)
         

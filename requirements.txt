@@ -5,11 +5,10 @@ jinja2
 opencv-python-headless
 numpy
 pillow
-torch
-torchvision
 ultralytics
 gunicorn
 sqlalchemy
 psycopg2-binary
 onnx
 onnxruntime
+gradio_client

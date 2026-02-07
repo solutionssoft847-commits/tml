@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Industrial Inspector | Admin Dashboard</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+
+<body>
+    <div class="dashboard-container">
+        <!-- Mobile Menu Button -->
+        <button id="mobile-menu-btn" class="mobile-menu-btn">
+            <i class="fa-solid fa-bars"></i>
+        </button>
+
+        <!-- Sidebar -->
+        <aside class="sidebar" id="sidebar">
+            <div class="logo-section">
+                <!-- TMTL Logo -->
+                <div class="logo-box">
+                    <img src="/static/images/logo.png" alt="TMTL" class="sidebar-logo">
+                    <span>TMTL</span>
+                </div>
+            </div>
+
+            <nav class="nav-menu">
+                <a href="#" class="nav-item active" data-target="overview">
+                    <i class="fa-solid fa-chart-pie"></i> Overview
+                </a>
+                <a href="#" class="nav-item" data-target="live">
+                    <i class="fa-solid fa-eye"></i> Live Inspection
+                </a>
+                <a href="#" class="nav-item" data-target="templates">
+                    <i class="fa-solid fa-layer-group"></i> Templates
+                </a>
+                <a href="#" class="nav-item" data-target="camera">
+                    <i class="fa-solid fa-video"></i> Camera Management
+                </a>
+                <a href="#" class="nav-item" data-target="history">
+                    <i class="fa-solid fa-clock-rotate-left"></i> History
+                </a>
+                <!-- Settings Link Removed -->
+            </nav>
+
+            <div class="sidebar-footer">
+                <div class="live-inspection-preview">
+                    <h4>Live Cam</h4>
+                    <div class="live-feed-container small">
+                        <img src="/api/video_feed" alt="Live Feed" id="sidebar-live-feed">
+                    </div>
+                    <div id="detection-result" class="detection-status waiting">
+                        System Ready
+                    </div>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <header class="top-header">
+                <div class="brand-section">
+                    <!-- Logo will be served from static/images/logo.png -->
+                    <img src="/static/images/logo.png" alt="TMTL Logo" class="brand-logo"
+                        onerror="this.src='https://via.placeholder.com/150x50?text=TMTL+Logo'">
+                    <div class="breadcrumbs">
+                        <span>System</span> / <span id="current-page">Overview</span>
+                    </div>
+                </div>
+                <div class="user-profile">
+                    <button class="btn-primary" id="open-scan-modal">
+                        <i class="fa-solid fa-camera"></i> Quick Scan
+                    </button>
+                    <div class="user-info">
+                        <img src="https://ui-avatars.com/api/?name=TMTL+Admin&background=0D8ABC&color=fff" alt="User">
+                        <span>TMTL Admin</span>
+                    </div>
+                </div>
+            </header>
+
+            <!-- Sections -->
+            <div id="overview-section" class="content-section active">
+                <div class="stats-grid">
+                    <div class="stat-card total">
+                        <div class="icon-box"><i class="fa-solid fa-box-open"></i></div>
+                        <div class="stat-info">
+                            <h3>Total Scans</h3>
+                            <p id="total-scans">0</p>
+                        </div>
+                    </div>
+                    <div class="stat-card perfect">
+                        <div class="icon-box"><i class="fa-solid fa-check-circle"></i></div>
+                        <div class="stat-info">
+                            <h3>Perfect Units</h3>
+                            <p id="perfect-count">0</p>
+                        </div>
+                    </div>
+                    <div class="stat-card defected">
+                        <div class="icon-box"><i class="fa-solid fa-triangle-exclamation"></i></div>
+                        <div class="stat-info">
+                            <h3>Defected</h3>
+                            <p id="defected-count">0</p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="overview-charts">
+                    <div class="chart-container">
+                        <h3>Last 24h Scan History</h3>
+                        <div class="history-list" id="recent-history-list">
+                            <div class="empty-state">No recent scans</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div id="live-section" class="content-section">
+                <h2>Live Inspection Board</h2>
+                <div class="live-large-container">
+                    <div class="main-feed">
+                        <img src="/api/video_feed" alt="Live Feed Large">
+                        <div class="overlay-stats">
+                            <span class="badge">Live</span>
+                            <span class="fps">30 FPS</span>
+                        </div>
+                    </div>
+                    <div class="inspection-controls">
+                        <div style="display: flex; gap: 10px;">
+                            <button class="btn-primary large" onclick="triggerManualScan()">
+                                <i class="fa-solid fa-play"></i> Start Inspection
+                            </button>
+                            <button class="btn-primary large" style="background-color: var(--danger-color);"
+                                onclick="stopInspection()">
+                                <i class="fa-solid fa-stop"></i> Stop Inspection
+                            </button>
+                        </div>
+                        <div class="last-result-card">
+                            <h4>Last Result</h4>
+                            <div id="large-result-display">Waiting for input...</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div id="templates-section" class="content-section">
+                <div class="section-header">
+                    <h2>Template Management</h2>
+                    <button class="btn-primary" onclick="openTemplateWizard()">
+                        <i class="fa-solid fa-plus"></i> New Template
+                    </button>
+                </div>
+                <div class="template-grid">
+                    <div class="info-card">
+                        <h3><i class="fa-solid fa-info-circle"></i> Reference System</h3>
+                        <p>Upload 3-10 images of PERFECT parts to train the reference system. This improves defect
+                            detection accuracy.</p>
+                    </div>
+                    <div class="upload-zone" id="template-upload-zone">
+                        <i class="fa-solid fa-cloud-arrow-up"></i>
+                        <p>Drag & drop reference images here or click to browse</p>
+                        <p class="sub-text">(Min 3, Max 10 images)</p>
+                        <input type="file" id="template-files" multiple hidden accept="image/*">
+                    </div>
+                    <div id="template-preview-list" class="preview-list"></div>
+                    <button id="save-template-btn" class="btn-success hidden">
+                        <i class="fa-solid fa-save"></i> Save Reference Model
+                    </button>
+                </div>
+            </div>
+
+            <div id="camera-section" class="content-section">
+                <h2>Camera Management</h2>
+                <div class="camera-grid">
+                    <!-- ... existing camera cards ... -->
+                    <div class="camera-card 3d-effect">
+                        <div class="card-icon"><i class="fa-solid fa-video"></i></div>
+                        <h3>USB Webcam</h3>
+                        <p>Integrated webcam or USB connected device.</p>
+                        <button class="btn-secondary" onclick="selectCamera('usb')">Select</button>
+                    </div>
+                    <div class="camera-card 3d-effect">
+                        <div class="card-icon"><i class="fa-solid fa-network-wired"></i></div>
+                        <h3>IP Camera</h3>
+                        <p>Network stream (RTSP/HTTP).</p>
+                        <button class="btn-secondary" onclick="selectCamera('ip')">Configure</button>
+                    </div>
+                </div>
+            </div>
+
+            <div id="history-section" class="content-section">
+                <!-- ... existing history section ... -->
+                <div class="section-header">
+                    <h2>Inspection History</h2>
+                    <button class="btn-outline" onclick="exportHistory()">
+                        <i class="fa-solid fa-file-excel"></i> Export to Excel
+                    </button>
+                </div>
+                <div class="table-container">
+                    <table class="history-table">
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>Time</th>
+                                <th>Status</th>
+                                <th>Defects</th>
+                            </tr>
+                        </thead>
+                        <tbody id="history-table-body">
+                            <!-- Populated by JS -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+        </main>
+    </div>
+
+    <!-- Quick Scan Modal -->
+    <div id="scan-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3><i class="fa-solid fa-camera"></i> Quick Scan - Defect Detection</h3>
+                <span class="close-modal">&times;</span>
+            </div>
+            <div class="modal-body">
+                <div class="tab-buttons">
+                    <button class="tab-btn active" data-tab="webcam">
+                        <i class="fa-solid fa-camera"></i> Use Webcam
+                    </button>
+                    <button class="tab-btn" data-tab="upload">
+                        <i class="fa-solid fa-upload"></i> Upload Image
+                    </button>
+                </div>
+
+                <div id="tab-webcam" class="tab-content active">
+                    <div class="modal-live-view">
+                        <img src="/api/video_feed" alt="Webcam">
+                    </div>
+                    <button class="btn-primary full-width" onclick="captureAndScan()">
+                        <i class="fa-solid fa-bolt"></i> Capture & Scan
+                    </button>
+                </div>
+
+                <div id="tab-upload" class="tab-content">
+                    <p>Select Image</p>
+                    <div class="file-input-wrapper">
+                        <label for="modal-file-upload" class="custom-file-upload">
+                            Choose File
+                        </label>
+                        <span id="file-name">No file chosen</span>
+                        <input type="file" id="modal-file-upload" accept="image/*">
+                    </div>
+                    <button class="btn-primary full-width" id="modal-upload-btn" disabled>
+                        <i class="fa-solid fa-magnifying-glass"></i> Analyze
+                    </button>
+                </div>
+
+                <div id="scan-result" class="scan-result-box hidden">
+                    <!-- Result will be shown here -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/js/admin.js"></script>
+</body>
+
+</html>

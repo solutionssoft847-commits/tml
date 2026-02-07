@@ -443,3 +443,59 @@ async function selectCamera(type) {
         alert("Failed to switch camera");
     }
 }
+
+// WebSocket connection for real-time updates
+function initWebSocket() {
+    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const ws = new WebSocket(`${wsProtocol}//${window.location.host}/ws`);
+
+    ws.onopen = () => {
+        console.log('[WS] Connected');
+    };
+
+    ws.onmessage = (event) => {
+        const message = JSON.parse(event.data);
+
+        if (message.type === 'stats_update') {
+            // Update stats
+            const data = message.data;
+            document.getElementById('total-scans').innerText = data.total_scans;
+            document.getElementById('perfect-count').innerText = data.perfect_count;
+            document.getElementById('defected-count').innerText = data.defected_count;
+        }
+
+        if (message.type === 'live_status') {
+            // Update live status indicator
+            const statusDiv = document.getElementById('detection-result');
+            if (statusDiv) {
+                if (message.data.status === 'PERFECT') {
+                    statusDiv.innerHTML = '<i class="fa-solid fa-check-circle"></i> PERFECT';
+                    statusDiv.className = 'detection-status perfect';
+                } else if (message.data.status === 'DEFECTIVE') {
+                    statusDiv.innerHTML = '<i class="fa-solid fa-times-circle"></i> DEFECTIVE';
+                    statusDiv.className = 'detection-status defective';
+                }
+            }
+        }
+    };
+
+    ws.onclose = () => {
+        console.log('[WS] Disconnected. Reconnecting in 3s...');
+        setTimeout(initWebSocket, 3000);
+    };
+
+    ws.onerror = (err) => {
+        console.error('[WS] Error:', err);
+        ws.close();
+    };
+}
+
+// Initialize WebSocket on page load
+document.addEventListener('DOMContentLoaded', () => {
+    initWebSocket();
+});
+
+// Trigger manual scan from live feed
+function triggerManualScan() {
+    alert("Live inspection started! Results will appear in real-time.");
+}

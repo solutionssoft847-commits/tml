@@ -11,3 +11,5 @@ ultralytics
 gunicorn
 sqlalchemy
 psycopg2-binary
+onnx
+onnxruntime

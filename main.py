@@ -101,6 +101,60 @@ def get_stats_from_db(db: Session):
 async def get_stats(db: Session = Depends(get_db)):
     return get_stats_from_db(db)
 
+@app.post("/api/update_status")
+async def update_status(request: Request, db: Session = Depends(get_db)):
+    
+    data = await request.json()
+    status = data.get('status', 'UNKNOWN')
+    latency_ms = data.get('latency_ms', 0)
+    defective_count = data.get('defective_count', 0)
+    
+    # Update Stats in DB
+    if db:
+        stats = db.query(Stats).first()
+        if stats:
+            stats.total_scans += 1
+            if status == 'PERFECT':
+                stats.perfect_count += 1
+            elif status == 'DEFECTIVE':
+                stats.defected_count += 1
+            db.commit()
+    
+    # Update last_24h cache
+    global last_24h_cache
+    last_24h_cache.append({
+        'timestamp': time.time(),
+        'status': status
+    })
+    
+    # Add to history in DB
+    if db:
+        record = InspectionRecord(
+            timestamp=datetime.utcnow(),
+            status=status,
+            defects=defective_count,
+            processing_time=latency_ms
+        )
+        db.add(record)
+        db.commit()
+    
+    # Broadcast via WebSocket
+    await manager.broadcast({
+        "type": "stats_update",
+        "data": get_stats_from_db(db)
+    })
+    await manager.broadcast({
+        "type": "live_status",
+        "data": {"status": status, "latency_ms": latency_ms}
+    })
+    
+    return {"message": "Status received", "status": status}
+
+@app.get("/health")
+def health_check():
+    """Health check for Render deployment"""
+    return {"status": "ok", "service": "inspector-api"}
+
 @app.get("/api/history")
 async def get_history(db: Session = Depends(get_db)):
     if db is None:

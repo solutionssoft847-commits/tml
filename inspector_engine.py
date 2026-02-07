@@ -8,9 +8,11 @@ from typing import List, Tuple, Dict, Optional
 from dataclasses import dataclass
 import time
 import torch
+import torch.onnx
 import torchvision
 from torchvision import transforms
-from torchvision.models import resnet50, ResNet50_Weights
+# from torchvision.models import resnet50, ResNet50_Weights
+from torchvision.models import resnet18, ResNet18_Weights
 import torch.nn.functional as F
 import warnings
 
@@ -43,6 +45,30 @@ class SaddleROI:
             'confidence': float(self.confidence)
         }
 
+
+def export_resnet18_onnx():
+    model = OptimizedFeatureExtractor().model
+    model.eval()
+    
+    dummy_input = torch.randn(4, 3, 224, 224)  # Batch of 4
+    
+    torch.onnx.export(
+        model,
+        dummy_input,
+        "resnet18_features_fp16.onnx",
+        input_names=['input'],
+        output_names=['features'],
+        dynamic_axes={'input': {0: 'batch_size'}},
+        opset_version=17
+    )
+    
+    # Convert to FP16 for 2× speedup
+    import onnx
+    from onnxconverter_common import float16
+    
+    model_fp32 = onnx.load("resnet18_features_fp16.onnx")
+    model_fp16 = float16.convert_float_to_float16(model_fp32)
+    onnx.save(model_fp16, "resnet18_features_fp16.onnx")
 
 @dataclass
 class SaddleInspectionResult:
@@ -350,84 +376,59 @@ class GeometricSaddleDetector:
         return saddles
     
     def _detect_circles(self, image: np.ndarray) -> Tuple[Optional[Tuple], Optional[Tuple]]:
-        """Detect outer and inner circles with robust fallback"""
-        
+        """
+        Detect outer and inner circles - OPTIMIZED (no loop).
+        Uses single HoughCircles call + contour fallback for speed.
+        """
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
         h, w = gray.shape
         
         gray_blur = cv2.GaussianBlur(gray, (9, 9), 2)
         
-        # Try multiple parameter sets (from strict to relaxed)
-        param_sets = [
-            # (dp, minDist, param1, param2, minR_factor, maxR_factor)
-            (1.0, 100, 100, 30, 0.3, 0.6),  # Original strict
-            (1.0, 80, 80, 25, 0.25, 0.65),  # Slightly relaxed
-            (1.0, 50, 50, 30, 0.2, 0.7),    # Moderate
-            (1.5, 30, 30, 20, 0.15, 0.75),  # Very relaxed
-        ]
+        # Single optimized parameter set (balanced for most cases)
+        minRadius = int(min(h, w) * 0.25)
+        maxRadius = int(min(h, w) * 0.65)
         
-        circles = None
+        circles = cv2.HoughCircles(
+            gray_blur,
+            cv2.HOUGH_GRADIENT,
+            dp=1.0,
+            minDist=80,
+            param1=80,
+            param2=25,
+            minRadius=minRadius,
+            maxRadius=maxRadius
+        )
         
-        for dp, minDist, param1, param2, minR_factor, maxR_factor in param_sets:
-            minRadius = int(min(h, w) * minR_factor)
-            maxRadius = int(min(h, w) * maxR_factor)
-            
-            circles = cv2.HoughCircles(
-                gray_blur,
-                cv2.HOUGH_GRADIENT,
-                dp=dp,
-                minDist=minDist,
-                param1=param1,
-                param2=param2,
-                minRadius=minRadius,
-                maxRadius=maxRadius
-            )
-            
-            if circles is not None and len(circles[0]) >= 1:
-                print(f"  Circles found with params: dp={dp}, param1={param1}, param2={param2}")
-                break
+        if circles is not None and len(circles[0]) >= 1:
+            circles = np.round(circles[0, :]).astype(int)
+            circles = sorted(circles, key=lambda c: c[2], reverse=True)
+            outer = tuple(circles[0])
+            inner_radius = int(outer[2] * 0.4)
+            inner = (outer[0], outer[1], inner_radius)
+            print(f"  [OK] Detected: outer={outer}, inner={inner}")
+            return outer, inner
         
-        if circles is None:
-            print("  ⚠ No circles detected - using image-based defaults")
-            center_x, center_y = w // 2, h // 2
-            
-            # Estimate radius based on image content
-            # Look for the largest concentration of edges
-            edges = cv2.Canny(gray_blur, 30, 100)
-            
-            # Find contours
-            contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            if contours:
-                # Find largest contour
-                largest = max(contours, key=cv2.contourArea)
-                (cx, cy), radius = cv2.minEnclosingCircle(largest)
-                center_x, center_y = int(cx), int(cy)
-                outer_radius = int(radius * 0.9)  # Slightly smaller than enclosing
-                print(f"  Using contour-based estimate: center=({center_x},{center_y}), radius={outer_radius}")
-            else:
-                # Last resort: use image dimensions
-                outer_radius = min(w, h) // 2 - 50
-                print(f"  Using dimension-based estimate: center=({center_x},{center_y}), radius={outer_radius}")
-            
+        # Contour-based fallback (faster than trying multiple HoughCircles params)
+        print("  [WARN] HoughCircles failed - using contour fallback")
+        edges = cv2.Canny(gray_blur, 30, 100)
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if contours:
+            largest = max(contours, key=cv2.contourArea)
+            (cx, cy), radius = cv2.minEnclosingCircle(largest)
+            center_x, center_y = int(cx), int(cy)
+            outer_radius = int(radius * 0.9)
             inner_radius = int(outer_radius * 0.4)
+            print(f"  Using contour estimate: center=({center_x},{center_y}), radius={outer_radius}")
             return ((center_x, center_y, outer_radius), (center_x, center_y, inner_radius))
         
-        circles = np.round(circles[0, :]).astype(int)
-        
-        # Sort by radius (largest first)
-        circles = sorted(circles, key=lambda c: c[2], reverse=True)
-        
-        # Outer circle = largest
-        outer = tuple(circles[0])
-        
-        # Inner circle = estimate from outer
-        inner_radius = int(outer[2] * 0.4)
-        inner = (outer[0], outer[1], inner_radius)
-        
-        print(f"  ✓ Detected: outer={outer}, inner={inner}")
-        
-        return outer, inner
+        # Last resort: image center
+        center_x, center_y = w // 2, h // 2
+        outer_radius = min(w, h) // 2 - 50
+        inner_radius = int(outer_radius * 0.4)
+        print(f"  Using dimension-based estimate: center=({center_x},{center_y}), radius={outer_radius}")
+        return ((center_x, center_y, outer_radius), (center_x, center_y, inner_radius))
     
     def _create_sector_mask(self, shape, center, outer_r, inner_r, start_angle, end_angle):
         """Create sector mask"""
@@ -512,62 +513,124 @@ class AlignmentCorrector:
 
 class CNNFeatureExtractor:
     """
-    ResNet-50 feature extraction for deep similarity
+    ResNet-18 ONNX feature extraction for deep similarity
     
-    Your approach:
-    1. Remove classification head
-    2. Extract embeddings
-    3. Cosine similarity between reference and test
+    Optimizations:
+    1. Uses ONNX Runtime instead of PyTorch (faster CPU inference)
+    2. ResNet-18 instead of ResNet-50 (11M vs 25M params)
+    3. Supports batch processing for multiple saddles at once
+    4. 512-dim embeddings (vs 2048-dim for ResNet-50)
     """
     
-    def __init__(self, use_gpu: bool = False):
-        self.device = torch.device('cuda' if use_gpu and torch.cuda.is_available() else 'cpu')
+    def __init__(self, onnx_path: str = "resnet18_features.onnx"):
+        self.onnx_path = onnx_path
+        self.session = None
+        self.feature_dim = 512  # ResNet-18 feature dimension
         
-        weights = ResNet50_Weights.IMAGENET1K_V2
-        self.model = resnet50(weights=weights)
+        # Try to load ONNX model
+        try:
+            import onnxruntime as ort
+            
+            # Use CPU with optimization
+            sess_options = ort.SessionOptions()
+            sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            sess_options.intra_op_num_threads = 4  # Parallel within ops
+            
+            self.session = ort.InferenceSession(
+                onnx_path,
+                sess_options,
+                providers=['CPUExecutionProvider']
+            )
+            print(f"[OK] ONNX ResNet-18 loaded: {onnx_path}")
+            
+        except Exception as e:
+            print(f"[WARN] ONNX load failed: {e}, falling back to PyTorch")
+            self._init_pytorch_fallback()
+    
+    def _init_pytorch_fallback(self):
+        """Fallback to PyTorch if ONNX not available"""
+        from torchvision.models import resnet18, ResNet18_Weights
         
-        # Remove classification head - keep only feature extractor
-        self.model = torch.nn.Sequential(*list(self.model.children())[:-1])
-        
+        self.device = torch.device('cpu')
+        weights = ResNet18_Weights.IMAGENET1K_V1
+        model = resnet18(weights=weights)
+        self.model = torch.nn.Sequential(*list(model.children())[:-1])
         self.model.to(self.device)
         self.model.eval()
-        
-        self.transform = transforms.Compose([
-            transforms.ToPILImage(),
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                               std=[0.229, 0.224, 0.225])
-        ])
-        
-        print(f"✓ ResNet-50 feature extractor on {self.device}")
+        self.session = None  # Mark as using PyTorch
+        print("[OK] PyTorch ResNet-18 fallback initialized")
     
-    def extract_features(self, image: np.ndarray) -> np.ndarray:
-        """
-        Extract 2048-dim feature embedding
-        
-        Returns: L2-normalized feature vector
-        """
-        
+    def _preprocess_image(self, image: np.ndarray) -> np.ndarray:
+        """Preprocess a single image for inference"""
         # Handle edge cases
         if image is None or image.size == 0:
-            return np.zeros(2048, dtype=np.float32)
+            return np.zeros((3, 224, 224), dtype=np.float32)
         
         # Convert to RGB
         if len(image.shape) == 2:
             image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
-        elif image.shape[2] == 4:
+        elif len(image.shape) == 3 and image.shape[2] == 4:
             image = cv2.cvtColor(image, cv2.COLOR_BGRA2RGB)
+        elif len(image.shape) == 3 and image.shape[2] == 3:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
-        # Transform and extract
-        img_tensor = self.transform(image).unsqueeze(0).to(self.device)
+        # Resize to 224x224
+        image = cv2.resize(image, (224, 224))
         
-        with torch.no_grad():
-            features = self.model(img_tensor)
+        # Normalize (ImageNet stats)
+        image = image.astype(np.float32) / 255.0
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        image = (image - mean) / std
         
-        # Convert to numpy and normalize
-        features = features.squeeze().cpu().numpy()
-        features = features / (np.linalg.norm(features) + 1e-8)
+        # HWC to CHW
+        image = image.transpose(2, 0, 1)
+        
+        return image
+    
+    def extract_features(self, image: np.ndarray) -> np.ndarray:
+        """
+        Extract 512-dim feature embedding for a single image
+        
+        Returns: L2-normalized feature vector
+        """
+        batch = self._preprocess_image(image)[np.newaxis, ...]  # Add batch dim
+        features = self.extract_batch(batch)
+        return features[0]
+    
+    def extract_batch(self, images: List[np.ndarray]) -> np.ndarray:
+        """
+        Extract features for a batch of images (optimized for 4 saddles)
+        
+        Args:
+            images: List of images (raw numpy arrays) or pre-processed batch tensor
+        
+        Returns: (N, 512) array of L2-normalized feature vectors
+        """
+        # If already a tensor, use directly
+        if isinstance(images, np.ndarray) and len(images.shape) == 4:
+            batch = images.astype(np.float32)
+        else:
+            # Preprocess each image and stack
+            preprocessed = [self._preprocess_image(img) for img in images]
+            batch = np.stack(preprocessed, axis=0).astype(np.float32)
+        
+        if self.session is not None:
+            # ONNX Runtime inference
+            outputs = self.session.run(None, {'input': batch})
+            features = outputs[0]  # Shape: (N, 512, 1, 1)
+            features = features.reshape(features.shape[0], -1)  # (N, 512)
+        else:
+            # PyTorch fallback
+            import torch
+            batch_tensor = torch.from_numpy(batch).to(self.device)
+            with torch.no_grad():
+                features = self.model(batch_tensor)
+            features = features.squeeze(-1).squeeze(-1).cpu().numpy()
+        
+        # L2 normalize each feature vector
+        norms = np.linalg.norm(features, axis=1, keepdims=True) + 1e-8
+        features = features / norms
         
         return features
     
@@ -575,11 +638,10 @@ class CNNFeatureExtractor:
         """
         Cosine similarity between two feature vectors
         
-        Formula: cos(θ) = (A · B) / (||A|| ||B||)
+        Formula: cos(theta) = (A . B) / (||A|| ||B||)
         
         Returns: Similarity in [0, 1]
         """
-        
         similarity = np.dot(features1, features2) / (
             np.linalg.norm(features1) * np.linalg.norm(features2) + 1e-8
         )
@@ -725,6 +787,61 @@ class GeometricConstraintValidator:
                 return scale
         
         return 1.0
+    
+    def validate_geometry(self, saddles: List[SaddleROI], tolerance: float = 0.05) -> Tuple[bool, str]:
+        """
+        Validate that detected saddles form the expected geometric pattern.
+        
+        Checks:
+        1. Saddles form a straight line (collinearity check)
+        2. Distances between adjacent saddles are within ±tolerance of golden distances
+        
+        Args:
+            saddles: List of detected saddles (should be 4)
+            tolerance: Allowed deviation from golden distance (default 5%)
+        
+        Returns:
+            (is_valid, reason_if_invalid)
+        """
+        if len(saddles) != self.expected_count:
+            return False, f"Expected {self.expected_count} saddles, got {len(saddles)}"
+        
+        if self.reference_distances is None or not self.reference_distances:
+            return True, "No reference geometry to validate against"
+        
+        # Sort saddles by ID to ensure consistent ordering
+        sorted_saddles = sorted(saddles, key=lambda s: s.id)
+        centers = [np.array(s.center) for s in sorted_saddles]
+        
+        # Check 1: Collinearity - all points should lie on a line
+        # Use cross product to check if points are collinear
+        if len(centers) >= 3:
+            v1 = centers[1] - centers[0]  # Vector from saddle 0 to 1
+            for i in range(2, len(centers)):
+                v2 = centers[i] - centers[0]  # Vector from saddle 0 to i
+                # Cross product in 2D: v1.x * v2.y - v1.y * v2.x
+                cross = abs(v1[0] * v2[1] - v1[1] * v2[0])
+                line_length = np.linalg.norm(v1) * np.linalg.norm(v2)
+                # Normalize by line length to get deviation ratio
+                if line_length > 0:
+                    deviation = cross / line_length
+                    if deviation > 0.1:  # 10% deviation from line
+                        return False, f"Saddles not collinear (deviation: {deviation:.2f})"
+        
+        # Check 2: Distance validation - compare adjacent saddle distances
+        for i in range(len(sorted_saddles) - 1):
+            s0, s1 = sorted_saddles[i], sorted_saddles[i + 1]
+            current_dist = np.linalg.norm(centers[i + 1] - centers[i])
+            
+            key = (min(s0.id, s1.id), max(s0.id, s1.id))
+            if key in self.reference_distances:
+                ref_dist = self.reference_distances[key]
+                if ref_dist > 0:
+                    deviation = abs(current_dist - ref_dist) / ref_dist
+                    if deviation > tolerance:
+                        return False, f"Distance S{s0.id}-S{s1.id} off by {deviation*100:.1f}% (max: {tolerance*100}%)"
+        
+        return True, "Geometry valid"
 
 
 class MultiReferenceManager:
@@ -809,29 +926,39 @@ class MultiReferenceManager:
 
 class AdvancedBlockInspector:
     """
-    Advanced Engine Block Inspector
+    Advanced Engine Block Inspector - OPTIMIZED
     
     Features:
     1. YOLO-OBB detection with rotation angles
     2. Affine transformation for alignment
-    3. Multiple reference images
+    3. Multiple reference images (10-15 recommended)
     4. Geometric constraint validation
-    5. ResNet-50 deep feature matching
+    5. ResNet-18 ONNX feature matching (batch processing)
+    6. Frame skipping for live video (5 consecutive failures triggers geometric fallback)
     """
     
-    def __init__(self, yolo_model_path: Optional[str] = None):
+    def __init__(self, yolo_model_path: Optional[str] = None, onnx_path: str = "resnet18_features.onnx"):
         # Detectors
         self.yolo_detector = YOLOOBBDetector(yolo_model_path)
         self.geometric_detector = GeometricSaddleDetector()
         
-        # Feature extraction
-        self.cnn_extractor = CNNFeatureExtractor(use_gpu=False)
+        # Feature extraction (ONNX-based)
+        self.cnn_extractor = CNNFeatureExtractor(onnx_path=onnx_path)
         
         # Multi-reference manager
         self.reference_manager = MultiReferenceManager(self.cnn_extractor)
         
         # Geometric validator
         self.geo_validator = GeometricConstraintValidator(expected_count=4)
+        
+        # Frame skipping state for live video
+        self.consecutive_failures = 0
+        self.max_skip_frames = 5  # Trigger geometric fallback after 5 consecutive failures
+        
+        # Sliding window for result consensus (5 frames)
+        self.result_window = []  # Stores last N results: 'PERFECT', 'DEFECTIVE', or None
+        self.window_size = 5
+        self.geometry_tolerance = 0.05  # ±5% distance tolerance
         
         # Config
         self.config = {
@@ -842,11 +969,14 @@ class AdvancedBlockInspector:
             'use_alignment_correction': True,
             'infer_missing_saddles': True,
             'yolo_confidence': 0.25,
+            'use_geometry_validation': True,  # Enable geometric constraint validation
+            'use_sliding_window': True,  # Enable 5-frame consensus
         }
         
-        print("✓ Advanced Inspector initialized")
+        print("[OK] Advanced Inspector initialized (ONNX optimized)")
         print(f"  YOLO-OBB: {'Enabled' if self.config['use_yolo'] else 'Disabled'}")
-        print(f"  Geometric fallback: {'Enabled' if self.config['use_geometric_fallback'] else 'Disabled'}")
+        print(f"  Frame skip threshold: {self.max_skip_frames} frames")
+        print(f"  Sliding window: {self.window_size} frames")
     
     def add_reference_image(self, image: np.ndarray) -> bool:
         """Add a golden template image"""
@@ -961,6 +1091,159 @@ class AdvancedBlockInspector:
             alignment_status=alignment_status,
             block_angle=block_angle
         )
+    
+    def inspect_live_frame(self, image: np.ndarray) -> Optional[BlockInspectionResult]:
+        """
+        Inspect a live video frame with optimizations:
+        1. Frame skipping if YOLO fails (up to 5 consecutive failures)
+        2. Geometry validation (collinearity + ±5% distance tolerance)
+        3. Sliding window consensus (5/5 agreement required for final result)
+        
+        Returns:
+            BlockInspectionResult or None (if frame skipped or awaiting consensus)
+        """
+        start_time = time.time()
+        
+        # Step 1: Try YOLO detection
+        saddles = []
+        if self.config['use_yolo']:
+            saddles = self.yolo_detector.detect_saddles(
+                image, conf_threshold=self.config['yolo_confidence']
+            )
+        
+        # Step 2: Frame skipping logic
+        if len(saddles) < self.config['expected_saddles']:
+            self.consecutive_failures += 1
+            
+            if self.consecutive_failures < self.max_skip_frames:
+                return None  # Skip frame
+            else:
+                print(f"  [FALLBACK] {self.consecutive_failures} failures - geometric detection")
+                saddles = self.geometric_detector.detect_saddles(image)
+                self.consecutive_failures = 0
+        else:
+            self.consecutive_failures = 0
+        
+        detected_count = len(saddles)
+        
+        # Step 3: Infer missing saddles
+        if len(saddles) < self.config['expected_saddles'] and self.config['infer_missing_saddles']:
+            saddles = self.geo_validator.infer_missing_saddles(saddles, image)
+        
+        # Step 4: Validate count
+        if len(saddles) != self.config['expected_saddles']:
+            self._add_to_window(None)  # Invalid frame
+            return self._error_result(f"ERROR: {len(saddles)}/{self.config['expected_saddles']} saddles", 0.0, saddles, detected_count)
+        
+        # Step 5: GEOMETRY VALIDATION - reject frames with invalid saddle geometry
+        if self.config.get('use_geometry_validation', True):
+            is_valid, reason = self.geo_validator.validate_geometry(saddles, self.geometry_tolerance)
+            if not is_valid:
+                self._add_to_window(None)  # Geometry invalid
+                return self._error_result(f"GEOMETRY: {reason}", 0.0, saddles, detected_count)
+        
+        alignment_status = "OK"
+        block_angle = np.mean([s.angle for s in saddles])
+        
+        # Step 6: BATCH feature extraction
+        aligned_crops = [AlignmentCorrector.correct_saddle(s) for s in saddles]
+        batch_features = self.cnn_extractor.extract_batch(aligned_crops)
+        
+        # Step 7: Compare each saddle against references
+        saddle_results = []
+        for i, saddle in enumerate(saddles):
+            test_features = batch_features[i]
+            best_sim = 0.0
+            avg_dist = 999.0
+            
+            for ref in self.reference_manager.references:
+                if saddle.id < len(ref['features']):
+                    ref_features = ref['features'][saddle.id]
+                    sim = self.cnn_extractor.compute_similarity(test_features, ref_features)
+                    dist = np.linalg.norm(test_features - ref_features)
+                    if sim > best_sim:
+                        best_sim = sim
+                        avg_dist = dist
+            
+            status = 'PERFECT' if best_sim >= self.config['similarity_threshold'] else 'DEFECTIVE'
+            saddle_results.append(SaddleInspectionResult(
+                saddle_id=saddle.id,
+                status=status,
+                similarity_score=best_sim,
+                confidence=best_sim,
+                feature_distance=avg_dist,
+                detected=saddle.confidence > 0.0
+            ))
+        
+        # Step 8: Block decision (single frame)
+        defective_count = sum(1 for r in saddle_results if r.status == 'DEFECTIVE')
+        frame_status = 'DEFECTIVE' if defective_count > 0 else 'PERFECT'
+        
+        # Step 9: SLIDING WINDOW CONSENSUS
+        self._add_to_window(frame_status)
+        
+        if self.config.get('use_sliding_window', True):
+            consensus = self._get_consensus()
+            if consensus is None:
+                # Not enough consistent frames - return result but mark as "PENDING"
+                block_status = 'PENDING'
+            else:
+                block_status = consensus
+        else:
+            block_status = frame_status
+        
+        processing_time = (time.time() - start_time) * 1000
+        
+        self.last_saddles = saddles
+        self.last_image = image
+        
+        return BlockInspectionResult(
+            block_status=block_status,
+            total_saddles=self.config['expected_saddles'],
+            detected_saddles=detected_count,
+            defective_saddles=defective_count,
+            saddle_results=saddle_results,
+            processing_time_ms=processing_time,
+            alignment_status=alignment_status,
+            block_angle=block_angle
+        )
+    
+    def _add_to_window(self, status: Optional[str]):
+        """Add result to sliding window"""
+        self.result_window.append(status)
+        if len(self.result_window) > self.window_size:
+            self.result_window.pop(0)
+    
+    def _get_consensus(self) -> Optional[str]:
+        """
+        Get consensus from sliding window.
+        
+        Rules:
+        - 5/5 PERFECT -> PERFECT
+        - 5/5 DEFECTIVE -> DEFECTIVE
+        - Mixed or contains None -> None (no consensus)
+        """
+        if len(self.result_window) < self.window_size:
+            return None  # Not enough data
+        
+        # Filter out None values
+        valid_results = [r for r in self.result_window if r is not None]
+        
+        if len(valid_results) < self.window_size:
+            return None  # Contains invalid frames
+        
+        # Check for unanimous decision
+        if all(r == 'PERFECT' for r in valid_results):
+            return 'PERFECT'
+        elif all(r == 'DEFECTIVE' for r in valid_results):
+            return 'DEFECTIVE'
+        else:
+            return None  # Mixed results - no consensus
+    
+    def reset_live_state(self):
+        """Reset live video state (call when switching to new block)"""
+        self.consecutive_failures = 0
+        self.result_window = []
     
     def _error_result(self, message: str, angle: float, saddles: List, detected_count: int) -> BlockInspectionResult:
         """Create error result"""

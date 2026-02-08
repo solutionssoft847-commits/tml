@@ -9,6 +9,10 @@ ultralytics
 gunicorn
 sqlalchemy
 psycopg2-binary
+asyncpg
 onnx
 onnxruntime
 gradio_client
+anyio
+httpx
+aiosqlite

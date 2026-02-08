@@ -4,8 +4,9 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Industrial Inspector | Admin Dashboard</title>
+    <title>Dashboard</title>
     <link rel="stylesheet" href="/static/css/style.css">
+    <link rel="stylesheet" href="/static/css/camera_admin.css">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 </head>
@@ -46,17 +47,7 @@
                 <!-- Settings Link Removed -->
             </nav>
 
-            <div class="sidebar-footer">
-                <div class="live-inspection-preview">
-                    <h4>Live Cam</h4>
-                    <div class="live-feed-container small">
-                        <img src="/api/video_feed" alt="Live Feed" id="sidebar-live-feed">
-                    </div>
-                    <div id="detection-result" class="detection-status waiting">
-                        System Ready
-                    </div>
-                </div>
-            </div>
+            <!-- Sidebar Footer Removed (Live Feed) -->
         </aside>
 
         <!-- Main Content -->
@@ -67,7 +58,7 @@
                     <img src="/static/images/logo.png" alt="TMTL Logo" class="brand-logo"
                         onerror="this.src='https://via.placeholder.com/150x50?text=TMTL+Logo'">
                     <div class="breadcrumbs">
-                        <span>System</span> / <span id="current-page">Overview</span>
+                        <span id="current-page">Overview</span>
                     </div>
                 </div>
                 <div class="user-profile">
@@ -94,14 +85,14 @@
                     <div class="stat-card perfect">
                         <div class="icon-box"><i class="fa-solid fa-check-circle"></i></div>
                         <div class="stat-info">
-                            <h3>Perfect Units</h3>
+                            <h3>Bearing Present</h3>
                             <p id="perfect-count">0</p>
                         </div>
                     </div>
                     <div class="stat-card defected">
                         <div class="icon-box"><i class="fa-solid fa-triangle-exclamation"></i></div>
                         <div class="stat-info">
-                            <h3>Defected</h3>
+                            <h3>Bearing Absent</h3>
                             <p id="defected-count">0</p>
                         </div>
                     </div>
@@ -124,15 +115,14 @@
                         <img src="/api/video_feed" alt="Live Feed Large">
                         <div class="overlay-stats">
                             <span class="badge">Live</span>
-                            <span class="fps">30 FPS</span>
                         </div>
                     </div>
                     <div class="inspection-controls">
-                        <div style="display: flex; gap: 10px;">
-                            <button class="btn-primary large" onclick="triggerManualScan()">
+                        <div class="control-grid" style="display: flex; gap: 10px; margin-bottom: 1.5rem;">
+                            <button class="btn-primary large" style="flex: 1;" onclick="startInspection()">
                                 <i class="fa-solid fa-play"></i> Start Inspection
                             </button>
-                            <button class="btn-primary large" style="background-color: var(--danger-color);"
+                            <button class="btn-primary large" style="flex: 1; background-color: var(--danger-color);"
                                 onclick="stopInspection()">
                                 <i class="fa-solid fa-stop"></i> Stop Inspection
                             </button>
@@ -152,40 +142,89 @@
                         <i class="fa-solid fa-plus"></i> New Template
                     </button>
                 </div>
-                <div class="template-grid">
-                    <div class="info-card">
-                        <h3><i class="fa-solid fa-info-circle"></i> Reference System</h3>
-                        <p>Upload 3-10 images of PERFECT parts to train the reference system. This improves defect
-                            detection accuracy.</p>
+                <div id="template-list-view">
+                    <div id="registered-templates-container" class="preview-list">
+                        <!-- Populated by JS -->
                     </div>
-                    <div class="upload-zone" id="template-upload-zone">
-                        <i class="fa-solid fa-cloud-arrow-up"></i>
-                        <p>Drag & drop reference images here or click to browse</p>
-                        <p class="sub-text">(Min 3, Max 10 images)</p>
-                        <input type="file" id="template-files" multiple hidden accept="image/*">
+                </div>
+
+                <div id="template-wizard-view" class="hidden">
+                    <div class="template-grid">
+                        <div class="info-card">
+                            <h3><i class="fa-solid fa-info-circle"></i> Reference System</h3>
+                            <p>Upload 3-10 images of PERFECT parts to train the reference system. This improvements
+                                defect detection accuracy.</p>
+                        </div>
+
+                        <div id="wizard-upload" class="wizard-tab-content">
+                            <div class="upload-zone" id="template-upload-zone">
+                                <i class="fa-solid fa-cloud-arrow-up"></i>
+                                <p>Drag & drop reference images here or click to browse</p>
+                                <p class="sub-text">(Min 3, Max 10 images)</p>
+                                <input type="file" id="template-files" multiple hidden accept="image/*">
+                            </div>
+                        </div>
+
+                        <div id="template-preview-list" class="preview-list"></div>
+                        <div style="display: flex; gap: 10px; margin-top: 1rem;">
+                            <button id="save-template-btn" class="btn-success hidden">
+                                <i class="fa-solid fa-save"></i> Save Reference Model
+                            </button>
+                            <button class="btn-outline" onclick="closeTemplateWizard()">
+                                <i class="fa-solid fa-times"></i> Cancel
+                            </button>
+                        </div>
                     </div>
-                    <div id="template-preview-list" class="preview-list"></div>
-                    <button id="save-template-btn" class="btn-success hidden">
-                        <i class="fa-solid fa-save"></i> Save Reference Model
-                    </button>
                 </div>
             </div>
 
             <div id="camera-section" class="content-section">
-                <h2>Camera Management</h2>
-                <div class="camera-grid">
-                    <!-- ... existing camera cards ... -->
-                    <div class="camera-card 3d-effect">
-                        <div class="card-icon"><i class="fa-solid fa-video"></i></div>
-                        <h3>USB Webcam</h3>
-                        <p>Integrated webcam or USB connected device.</p>
-                        <button class="btn-secondary" onclick="selectCamera('usb')">Select</button>
+                <div class="section-header">
+                    <h2>Camera Management</h2>
+                    <button class="btn-primary" onclick="openAddCameraModal()">
+                        <i class="fa-solid fa-plus"></i> Add Camera
+                    </button>
+                </div>
+
+                <div id="camera-list-container" class="camera-grid">
+                    <!-- Populated by JS -->
+                    <div class="camera-card loading">
+                        <p>Loading cameras...</p>
                     </div>
-                    <div class="camera-card 3d-effect">
-                        <div class="card-icon"><i class="fa-solid fa-network-wired"></i></div>
-                        <h3>IP Camera</h3>
-                        <p>Network stream (RTSP/HTTP).</p>
-                        <button class="btn-secondary" onclick="selectCamera('ip')">Configure</button>
+                </div>
+            </div>
+
+            <!-- Add Camera Modal -->
+            <div id="add-camera-modal" class="modal">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h3><i class="fa-solid fa-video"></i> Add New Camera</h3>
+                        <span class="close-modal" onclick="closeAddCameraModal()">&times;</span>
+                    </div>
+                    <div class="modal-body">
+                        <div class="form-group">
+                            <label>Camera Name</label>
+                            <input type="text" id="new-camera-name" placeholder="e.g. Production Line 1">
+                        </div>
+                        <div class="form-group">
+                            <label>Camera Type</label>
+                            <select id="new-camera-type">
+                                <option value="ip">IP Camera (RTSP/HTTP)</option>
+                                <option value="usb">USB Camera </option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>Stream URL / Path</label>
+                            <input type="text" id="new-camera-url">
+                        </div>
+                        <div style="display: flex; gap: 10px; margin-bottom: 1rem;">
+                            <button class="btn-secondary" onclick="testNewCameraConnection()" style="flex: 1;">
+                                <i class="fa-solid fa-flask"></i> Test Connection
+                            </button>
+                            <button class="btn-primary" onclick="saveNewCamera()" style="flex: 2;">
+                                <i class="fa-solid fa-save"></i> Save Camera
+                            </button>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -205,7 +244,7 @@
                                 <th>ID</th>
                                 <th>Time</th>
                                 <th>Status</th>
-                                <th>Defects</th>
+                                <th>View</th>
                             </tr>
                         </thead>
                         <tbody id="history-table-body">

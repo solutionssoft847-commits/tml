@@ -275,7 +275,9 @@ class GeometricSaddleDetector:
     """
     
     def __init__(self):
-        pass
+        self.cached_masks = {}  # (shape, center, outer_r, inner_r, start_angle, end_angle) -> mask
+        self.last_image_shape = None
+        self.last_annular_mask = None
     
     def detect_saddles(self, image: np.ndarray) -> List[SaddleROI]:
         """Detect using geometric segmentation"""
@@ -331,9 +333,14 @@ class GeometricSaddleDetector:
         saddles = []
         
         for idx, (start_angle, end_angle, name) in enumerate(quadrants):
-            sector_mask = self._create_sector_mask(
-                (h, w), (ox, oy), or_, ir, start_angle, end_angle
-            )
+            # Cache sector mask
+            mask_key = (h, w, ox, oy, or_, ir, start_angle, end_angle)
+            if mask_key not in self.cached_masks:
+                self.cached_masks[mask_key] = self._create_sector_mask(
+                    (h, w), (ox, oy), or_, ir, start_angle, end_angle
+                )
+            
+            sector_mask = self.cached_masks[mask_key]
             
             saddle_mask = cv2.bitwise_and(annular_mask, sector_mask)
             
@@ -369,7 +376,7 @@ class GeometricSaddleDetector:
                 confidence=1.0
             ))
             
-            print(f"[GeometricDetector] ✓ Saddle {idx} ({name}): center=({cx},{cy}), area={area}")
+            print(f"[GeometricDetector] ✓ Saddle {idx} ({name}): area={area}")
         
         print(f"[GeometricDetector] Total saddles detected: {len(saddles)}")
         
@@ -923,6 +930,20 @@ class MultiReferenceManager:
         """Number of reference images"""
         return len(self.references)
 
+    def get_references(self) -> List[str]:
+        """Return list of reference images as base64 strings"""
+        refs = []
+        for ref in self.references:
+            try:
+                # ref['image'] is a numpy array
+                _, buffer = cv2.imencode('.jpg', ref['image'], [cv2.IMWRITE_JPEG_QUALITY, 50])
+                import base64
+                img_str = base64.b64encode(buffer).decode('utf-8')
+                refs.append(f"data:image/jpeg;base64,{img_str}")
+            except:
+                continue
+        return refs
+
 
 class AdvancedBlockInspector:
     """
@@ -1020,6 +1041,28 @@ class AdvancedBlockInspector:
         
         start_time = time.time()
         
+        # Step 0: Quality Check (Waste/Dark Image Rejection)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        brightness = np.mean(gray)
+        if brightness < 30: # Threshold for "dark/waste" image
+            # print(f" [REJECT] Image too dark (Brightness: {brightness:.1f})")
+            return BlockInspectionResult(
+                block_status='WASTE_IMAGE',
+                total_saddles=self.config.get('expected_saddles', 4),
+                detected_saddles=0,
+                defective_saddles=0,
+                saddle_results=[],
+                processing_time_ms=(time.time() - start_time) * 1000,
+                alignment_status='REJECTED_DARK',
+                block_angle=0.0
+            )
+
+        # Performance Optimization: Resize high-res input
+        h, w = image.shape[:2]
+        if w > 800 or h > 600:
+            image = cv2.resize(image, (640, 480))
+            # print(f" [SPEEDUP] Resized input frame to 640x480")
+            
         # Step 1: Detect saddles
         if self.config['use_yolo']:
             saddles = self.yolo_detector.detect_saddles(
@@ -1244,6 +1287,10 @@ class AdvancedBlockInspector:
         """Reset live video state (call when switching to new block)"""
         self.consecutive_failures = 0
         self.result_window = []
+
+    def get_reference_images(self) -> List[str]:
+        """Return list of reference images from manager"""
+        return self.reference_manager.get_references()
     
     def _error_result(self, message: str, angle: float, saddles: List, detected_count: int) -> BlockInspectionResult:
         """Create error result"""

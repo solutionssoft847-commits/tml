@@ -425,11 +425,27 @@ async def inspect_upload(file: UploadFile = File(...)):
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(executor, insp.inspect_block, image)
     
-    # UNWRAP WRAPPER (Gradio/Remote results often come as a tuple/list)
-    if isinstance(result, (tuple, list)):
+    # ROBUST RESULT HANDLING (Gradio/Remote results can be JSON strings, tuples, or objects)
+    if isinstance(result, (tuple, list)) and len(result) > 0:
         result = result[0]
-        
-    result_dict = result if isinstance(result, dict) else result.to_dict()
+    
+    if isinstance(result, str):
+        try:
+            import json
+            result = json.loads(result)
+        except:
+            print(f"  ⚠ Result is string but not valid JSON: {result[:100]}...")
+            # Fallback if it's a simple status string
+            result = {"block_status": result if result else "UNKNOWN"}
+
+    # Final conversion to dict
+    if isinstance(result, dict):
+        result_dict = result
+    elif hasattr(result, 'to_dict'):
+        result_dict = result.to_dict()
+    else:
+        result_dict = {"block_status": "ERROR", "message": "Invalid result type from inspector"}
+    
     block_status = result_dict.get('block_status', 'UNKNOWN')
     
     if block_status == 'WASTE_IMAGE':

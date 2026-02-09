@@ -1147,7 +1147,7 @@ class AdvancedBlockInspector:
             'use_sliding_window': True,
             'use_structure_validation': STRUCTURE_VALIDATOR_AVAILABLE,
             'use_optimized_validator': self.use_optimized_validator,
-            'min_brightness': 42.0, # Reject frames with mean brightness below this
+            'min_brightness': 20.0, # Lowered to avoid false rejections
         }
         
         print("[OK] Advanced Inspector initialized (ONNX optimized)")
@@ -1200,7 +1200,7 @@ class AdvancedBlockInspector:
         # Step 0: Quality Check (Waste/Dark Image Rejection)
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         brightness = np.mean(gray)
-        if brightness < 30: # Threshold for "dark/waste" image
+        if brightness < 15: # Lowered from 30
             # print(f" [REJECT] Image too dark (Brightness: {brightness:.1f})")
             return BlockInspectionResult(
                 block_status='WASTE_IMAGE',

@@ -419,11 +419,20 @@ async def inspect_upload(file: UploadFile = File(...)):
     image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if image is None: return JSONResponse(status_code=400, content={"message": "Invalid image"})
     insp = get_inspector()
-    if isinstance(insp, RemoteBlockInspector):
-        result = await insp.inspect_block_async(image)
-    else:
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(executor, insp.inspect_block, image)
+    try:
+        if isinstance(insp, RemoteBlockInspector):
+            result = await asyncio.wait_for(insp.inspect_block_async(image), timeout=45.0)
+        else:
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(executor, insp.inspect_block, image)
+    except asyncio.TimeoutError:
+        return JSONResponse(status_code=504, content={"message": "Inference timed out. Hugging Face Space might be sleeping or slow."})
+    except Exception as e:
+        print(f"✗ Inference failed: {e}")
+        return JSONResponse(status_code=500, content={"message": f"Inference server error: {str(e)}"})
+
+    if result is None:
+        return JSONResponse(status_code=503, content={"message": "Inference server returned no data. Check HF Space status."})
     
     # ROBUST RESULT HANDLING (Gradio/Remote results can be [image_path, json_data])
     debug_result = result

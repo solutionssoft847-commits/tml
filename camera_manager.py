@@ -17,9 +17,10 @@ except (ImportError, RuntimeError, Exception) as e:
     print(f"ffmpegcv not available ({e}), falling back to cv2")
 
 class QualityFilter:
-    """Check image quality (blur detection)"""
-    def __init__(self, threshold: float = 100.0):
+    """Check image quality (blur detection + brightness)"""
+    def __init__(self, threshold: float = 120.0, min_brightness: float = 40.0):
         self.threshold = threshold
+        self.min_brightness = min_brightness
     
     def calculate_sharpness(self, image: np.ndarray) -> float:
         """Calculate Laplacian Variance"""
@@ -29,9 +30,24 @@ class QualityFilter:
             gray = image
         return cv2.Laplacian(gray, cv2.CV_64F).var()
     
-    def is_sharp(self, image: np.ndarray) -> Tuple[bool, float]:
-        score = self.calculate_sharpness(image)
-        return score > self.threshold, score
+    def check_quality(self, image: np.ndarray) -> Tuple[bool, str, float]:
+        """
+        Returns: (is_good, reason, score)
+        """
+        if len(image.shape) == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = image
+            
+        brightness = np.mean(gray)
+        if brightness < self.min_brightness:
+            return False, "DARK", brightness
+            
+        sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
+        if sharpness < self.threshold:
+            return False, "BLURRY", sharpness
+            
+        return True, "GOOD", sharpness
 
 class MotionGate:
     """
@@ -250,12 +266,12 @@ class CameraManager:
         
         if motion_state == "READY":
             # Motion stopped -> check quality
-            is_sharp, score = self.quality_filter.is_sharp(frame)
-            if is_sharp:
+            is_good, reason, score = self.quality_filter.check_quality(frame)
+            if is_good:
                 should_capture = True
                 print(f" [CAPTURE] Motion Stable ({self.motion_gate.stability_duration}s) & Sharp (Score: {score:.1f})")
             else:
-                print(f" [SKIP] Stable but Blurry (Score: {score:.1f})")
+                print(f" [SKIP] Stable but {reason} (Score: {score:.1f})")
                 
         return frame, should_capture
 

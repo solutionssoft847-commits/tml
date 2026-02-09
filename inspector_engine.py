@@ -7,26 +7,83 @@ from datetime import datetime
 from typing import List, Tuple, Dict, Optional
 from dataclasses import dataclass
 import time
-import torch
-import torch.onnx
-import torchvision
-from torchvision import transforms
-# from torchvision.models import resnet50, ResNet50_Weights
-from torchvision.models import resnet18, ResNet18_Weights
-import torch.nn.functional as F
+import os
 import warnings
 
-try:
-    from ultralytics import YOLO
-    YOLO_AVAILABLE = True
-except:
-    YOLO_AVAILABLE = False
+# ============================================================================
+# HUGGINGFACE SPACES
+# ============================================================================
+# Detect HF Space environment for memory-efficient loading
+IS_HF_SPACE = os.environ.get('SPACE_ID') is not None or os.environ.get('HF_SPACE') is not None
+IS_RENDER = os.environ.get('RENDER') is not None
+IS_CLOUD = IS_HF_SPACE or IS_RENDER
+
+# Lazy imports for faster cold start on HF Spaces
+_torch = None
+_torchvision = None
+_YOLO = None
+
+def _get_torch():
+    global _torch
+    if _torch is None:
+        import torch
+        _torch = torch
+        # CPU-only mode for HF Spaces (saves memory)
+        if IS_CLOUD:
+            _torch.set_num_threads(2)  # Limit threads for shared CPU
+    return _torch
+
+def _get_torchvision():
+    global _torchvision
+    if _torchvision is None:
+        import torchvision
+        _torchvision = torchvision
+    return _torchvision
+
+def _get_yolo():
+    global _YOLO
+    if _YOLO is None:
+        try:
+            from ultralytics import YOLO
+            _YOLO = YOLO
+        except ImportError:
+            _YOLO = False
+    return _YOLO
+
+# Check YOLO availability (lazy)
+def _yolo_available():
+    yolo = _get_yolo()
+    return yolo is not False and yolo is not None
+
+YOLO_AVAILABLE = None  # Will be set on first use
 
 warnings.filterwarnings('ignore')
 
+# Import optimized validators (lightweight, no heavy deps)
+try:
+    from saddle_structure_validator import SaddleStructureValidator, SaddleStructure
+    STRUCTURE_VALIDATOR_AVAILABLE = True
+except ImportError:
+    STRUCTURE_VALIDATOR_AVAILABLE = False
+    SaddleStructure = None
+
+try:
+    from geometric_validator import OptimizedGeometricValidator, PhysicalDimensions, PixelToMMCalibrator
+    OPTIMIZED_VALIDATOR_AVAILABLE = True
+except ImportError:
+    OPTIMIZED_VALIDATOR_AVAILABLE = False
+
+# Print environment info on import
+if IS_HF_SPACE:
+    print("[HF Space] Running in HuggingFace Spaces - memory-optimized mode")
+elif IS_RENDER:
+    print("[Render] Running on Render - optimized for cloud")
+
+
+
 @dataclass
 class SaddleROI:
-    """Saddle region of interest with rotation info"""
+    """Saddle region of interest with rotation and structure info"""
     id: int
     bbox: Tuple[int, int, int, int]  # x, y, w, h
     crop: np.ndarray
@@ -34,9 +91,10 @@ class SaddleROI:
     area: int
     angle: float  # Rotation angle from YOLO-OBB
     confidence: float  # Detection confidence
+    structure: Optional[any] = None  # Physical structure validation
     
     def to_dict(self):
-        return {
+        result = {
             'id': int(self.id),
             'bbox': [int(x) for x in self.bbox],
             'center': [int(self.center[0]), int(self.center[1])],
@@ -44,6 +102,11 @@ class SaddleROI:
             'angle': float(self.angle),
             'confidence': float(self.confidence)
         }
+        if self.structure is not None:
+            result['has_semicircle'] = bool(getattr(self.structure, 'has_semicircle', False))
+            result['has_middle_arc'] = bool(getattr(self.structure, 'has_middle_arc', False))
+            result['structure_confidence'] = float(getattr(self.structure, 'structure_confidence', 0.0))
+        return result
 
 
 def export_resnet18_onnx():
@@ -117,32 +180,46 @@ class BlockInspectionResult:
 
 
 class YOLOOBBDetector:
+    """YOLO-OBB Detector with lazy loading for HF Spaces"""
+    
     def __init__(self, model_path: Optional[str] = None):
         self.model = None
         self.model_loaded = False
-        self.available = YOLO_AVAILABLE
+        self._model_path = model_path if model_path else 'yolo26n-obb.pt'
+        self._initialized = False
+    
+    def _lazy_init(self):
+        """Lazy initialization - only load model when first needed"""
+        if self._initialized:
+            return
         
-        # Use provided path or default to v11/v8
-        target_path = model_path if model_path else 'yolo26n-obb.pt'
+        self._initialized = True
         
-        if self.available:
+        if not _yolo_available():
+            print(" ⚠ YOLO not available")
+            return
+        
+        YOLO = _get_yolo()
+        
+        try:
+            self.model = YOLO(self._model_path)
+            self.model_loaded = True
+            print(f" ✓ YOLO-OBB loaded: {self._model_path}")
+        except Exception as e:
             try:
-                self.model = YOLO(target_path)
+                fallback = 'yolo11n-obb.pt' if self._model_path == 'yolo26n-obb.pt' else 'yolo26n-obb.pt'
+                self.model = YOLO(fallback)
                 self.model_loaded = True
-                print(f" ✓ YOLO-OBB loaded: {target_path}")
-            except Exception as e:
-                try:
-                    # Fallback to alternative
-                    fallback = 'yolo11n-obb.pt' if target_path == 'yolo26n-obb.pt' else 'yolo26n-obb.pt'
-                    self.model = YOLO(fallback)
-                    self.model_loaded = True
-                    print(f" ✓ YOLO-OBB fallback loaded: {fallback}")
-                except:
-                    print(f" ✗ YOLO load failed: {e}")
-                    self.model_loaded = False
-                    self.available = False
-        else:
-            print(" ⚠ YOLO not available (check ultralytics installation)")
+                print(f" ✓ YOLO-OBB fallback: {fallback}")
+            except:
+                print(f" ✗ YOLO load failed: {e}")
+                self.model_loaded = False
+    
+    @property
+    def available(self):
+        if not self._initialized:
+            self._lazy_init()
+        return self.model_loaded
 
 
     def detect_saddles(self, image: np.ndarray, conf_threshold: float = 0.25) -> List[SaddleROI]:
@@ -520,42 +597,55 @@ class AlignmentCorrector:
 
 class CNNFeatureExtractor:
     """
-    ResNet-18 ONNX feature extraction for deep similarity
+    ResNet-18 ONNX feature extraction - LAZY LOADING for HF Spaces
     
     Optimizations:
-    1. Uses ONNX Runtime instead of PyTorch (faster CPU inference)
-    2. ResNet-18 instead of ResNet-50 (11M vs 25M params)
-    3. Supports batch processing for multiple saddles at once
-    4. 512-dim embeddings (vs 2048-dim for ResNet-50)
+    1. Lazy loading - model loaded on first use
+    2. ONNX Runtime with CPU optimization
+    3. Reduced threads for cloud environments
+    4. 512-dim embeddings for efficiency
     """
     
     def __init__(self, onnx_path: str = "resnet18_features.onnx"):
         self.onnx_path = onnx_path
         self.session = None
-        self.feature_dim = 512  # ResNet-18 feature dimension
+        self.model = None
+        self.device = None
+        self.feature_dim = 512
+        self._initialized = False
+    
+    def _lazy_init(self):
+        """Lazy initialization - load model on first use"""
+        if self._initialized:
+            return
+        self._initialized = True
         
-        # Try to load ONNX model
+        # Try ONNX first (faster on CPU)
         try:
             import onnxruntime as ort
             
-            # Use CPU with optimization
             sess_options = ort.SessionOptions()
             sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            sess_options.intra_op_num_threads = 4  # Parallel within ops
+            # Reduce threads for HF Spaces (shared CPU)
+            sess_options.intra_op_num_threads = 2 if IS_CLOUD else 4
             
             self.session = ort.InferenceSession(
-                onnx_path,
+                self.onnx_path,
                 sess_options,
                 providers=['CPUExecutionProvider']
             )
-            print(f"[OK] ONNX ResNet-18 loaded: {onnx_path}")
-            
+            print(f"[OK] ONNX ResNet-18 loaded: {self.onnx_path}")
+            return
         except Exception as e:
-            print(f"[WARN] ONNX load failed: {e}, falling back to PyTorch")
-            self._init_pytorch_fallback()
+            print(f"[WARN] ONNX failed: {e}, using PyTorch")
+        
+        # Fallback to PyTorch
+        self._init_pytorch_fallback()
     
     def _init_pytorch_fallback(self):
         """Fallback to PyTorch if ONNX not available"""
+        torch = _get_torch()
+        torchvision = _get_torchvision()
         from torchvision.models import resnet18, ResNet18_Weights
         
         self.device = torch.device('cpu')
@@ -564,7 +654,6 @@ class CNNFeatureExtractor:
         self.model = torch.nn.Sequential(*list(model.children())[:-1])
         self.model.to(self.device)
         self.model.eval()
-        self.session = None  # Mark as using PyTorch
         print("[OK] PyTorch ResNet-18 fallback initialized")
     
     def _preprocess_image(self, image: np.ndarray) -> np.ndarray:
@@ -601,7 +690,8 @@ class CNNFeatureExtractor:
         
         Returns: L2-normalized feature vector
         """
-        batch = self._preprocess_image(image)[np.newaxis, ...]  # Add batch dim
+        self._lazy_init()  # Ensure model is loaded
+        batch = self._preprocess_image(image)[np.newaxis, ...]
         features = self.extract_batch(batch)
         return features[0]
     
@@ -610,10 +700,12 @@ class CNNFeatureExtractor:
         Extract features for a batch of images (optimized for 4 saddles)
         
         Args:
-            images: List of images (raw numpy arrays) or pre-processed batch tensor
+            images: List of images or pre-processed batch tensor
         
         Returns: (N, 512) array of L2-normalized feature vectors
         """
+        self._lazy_init()  # Ensure model is loaded
+        
         # If already a tensor, use directly
         if isinstance(images, np.ndarray) and len(images.shape) == 4:
             batch = images.astype(np.float32)
@@ -629,7 +721,7 @@ class CNNFeatureExtractor:
             features = features.reshape(features.shape[0], -1)  # (N, 512)
         else:
             # PyTorch fallback
-            import torch
+            torch = _get_torch()
             batch_tensor = torch.from_numpy(batch).to(self.device)
             with torch.no_grad():
                 features = self.model(batch_tensor)
@@ -953,9 +1045,14 @@ class AdvancedBlockInspector:
     1. YOLO-OBB detection with rotation angles
     2. Affine transformation for alignment
     3. Multiple reference images (10-15 recommended)
-    4. Geometric constraint validation
+    4. OPTIMIZED Geometric constraint validation:
+       - RANSAC collinearity
+       - Physical dimension validation (55-95mm × 40-75mm)
+       - Semicircular surface + middle arc detection
+       - Mesh-based inference (1x4 grid)
+       - Automatic pixel-to-mm calibration
     5. ResNet-18 ONNX feature matching (batch processing)
-    6. Frame skipping for live video (5 consecutive failures triggers geometric fallback)
+    6. Frame skipping for live video
     """
     
     def __init__(self, yolo_model_path: Optional[str] = None, onnx_path: str = "resnet18_features.onnx"):
@@ -969,15 +1066,31 @@ class AdvancedBlockInspector:
         # Multi-reference manager
         self.reference_manager = MultiReferenceManager(self.cnn_extractor)
         
-        # Geometric validator
-        self.geo_validator = GeometricConstraintValidator(expected_count=4)
+        # OPTIMIZED: Use new geometric validator if available
+        if OPTIMIZED_VALIDATOR_AVAILABLE:
+            self.geo_validator = OptimizedGeometricValidator(expected_count=4)
+            self.use_optimized_validator = True
+            print("  ✓ Optimized Validator: RANSAC + Physical Dims + Structure")
+        else:
+            self.geo_validator = GeometricConstraintValidator(expected_count=4)
+            self.use_optimized_validator = False
+        
+        # OPTIMIZED: Structure validator for saddle validation
+        self.structure_validator = None
+        if STRUCTURE_VALIDATOR_AVAILABLE:
+            self.structure_validator = SaddleStructureValidator(
+                arc_center_tolerance=0.05,
+                min_arc_length_ratio=0.6,
+                min_structure_confidence=0.65
+            )
+            print("  ✓ Structure Validator: Semicircle + Middle Arc")
         
         # Frame skipping state for live video
         self.consecutive_failures = 0
-        self.max_skip_frames = 5  # Trigger geometric fallback after 5 consecutive failures
+        self.max_skip_frames = 5
         
         # Sliding window for result consensus (5 frames)
-        self.result_window = []  # Stores last N results: 'PERFECT', 'DEFECTIVE', or None
+        self.result_window = []
         self.window_size = 5
         self.geometry_tolerance = 0.05  # ±5% distance tolerance
         
@@ -990,8 +1103,11 @@ class AdvancedBlockInspector:
             'use_alignment_correction': True,
             'infer_missing_saddles': True,
             'yolo_confidence': 0.25,
-            'use_geometry_validation': True,  # Enable geometric constraint validation
-            'use_sliding_window': True,  # Enable 5-frame consensus
+            'use_geometry_validation': True,
+            'use_sliding_window': True,
+            'use_structure_validation': STRUCTURE_VALIDATOR_AVAILABLE,
+            'use_optimized_validator': self.use_optimized_validator,
+            'min_brightness': 57.0, # Reject frames with mean brightness below this
         }
         
         print("[OK] Advanced Inspector initialized (ONNX optimized)")
@@ -1116,7 +1232,17 @@ class AdvancedBlockInspector:
         
         # Step 6: Block decision
         defective_count = sum(1 for r in saddle_results if r.status == 'DEFECTIVE')
-        block_status = 'DEFECTIVE' if defective_count > 0 else 'PERFECT'
+        
+        # SANITY CHECK: If everything is defective and similarity is very low, it's WASTE/TRASH
+        avg_sim = np.mean([r.similarity_score for r in saddle_results]) if saddle_results else 0
+        if defective_count == self.config['expected_saddles'] and avg_sim < 0.86: # Increased from 0.82
+             # print(f" [REJECT] Low similarity consensus ({avg_sim:.3f}) - likely WASTE")
+             block_status = 'WASTE_IMAGE'
+        elif detected_count == 0:
+             # If we didn't actually detect ANY circles and just inferred everything, it's TRASH
+             block_status = 'WASTE_IMAGE'
+        else:
+             block_status = 'DEFECTIVE' if defective_count > 0 else 'PERFECT'
         
         processing_time = (time.time() - start_time) * 1000
         
@@ -1137,16 +1263,34 @@ class AdvancedBlockInspector:
     
     def inspect_live_frame(self, image: np.ndarray) -> Optional[BlockInspectionResult]:
         """
-        Inspect a live video frame with optimizations:
-        1. Frame skipping if YOLO fails (up to 5 consecutive failures)
-        2. Geometry validation (collinearity + ±5% distance tolerance)
-        3. Sliding window consensus (5/5 agreement required for final result)
+        Inspect a live video frame with OPTIMIZED validations:
+        1. Quality check (reject dark/waste images)
+        2. Frame skipping if YOLO fails
+        3. RANSAC collinearity + physical dimension validation
+        4. Semicircular surface + middle arc structure validation
+        5. Mesh-based inference for missing saddles
+        6. Sliding window consensus
         
         Returns:
-            BlockInspectionResult or None (if frame skipped or awaiting consensus)
+            BlockInspectionResult or None (if frame skipped)
         """
         start_time = time.time()
         
+        # Step 0: Quality Check (Waste/Dark Image Rejection)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        brightness = np.mean(gray)
+        if brightness < 40: # Increased threshold from 30 to 40
+            return BlockInspectionResult(
+                block_status='WASTE_IMAGE',
+                total_saddles=self.config.get('expected_saddles', 4),
+                detected_saddles=0,
+                defective_saddles=0,
+                saddle_results=[],
+                processing_time_ms=(time.time() - start_time) * 1000,
+                alignment_status='REJECTED_DARK',
+                block_angle=0.0
+            )
+
         # Step 1: Try YOLO detection
         saddles = []
         if self.config['use_yolo']:
@@ -1161,7 +1305,6 @@ class AdvancedBlockInspector:
             if self.consecutive_failures < self.max_skip_frames:
                 return None  # Skip frame
             else:
-                print(f"  [FALLBACK] {self.consecutive_failures} failures - geometric detection")
                 saddles = self.geometric_detector.detect_saddles(image)
                 self.consecutive_failures = 0
         else:
@@ -1169,20 +1312,28 @@ class AdvancedBlockInspector:
         
         detected_count = len(saddles)
         
-        # Step 3: Infer missing saddles
-        if len(saddles) < self.config['expected_saddles'] and self.config['infer_missing_saddles']:
+        # Step 3: OPTIMIZED - Validate and refine with structure + mesh inference
+        if self.use_optimized_validator and hasattr(self.geo_validator, 'validate_and_refine'):
+            saddles, refine_report = self.geo_validator.validate_and_refine(saddles, image)
+        elif len(saddles) < self.config['expected_saddles'] and self.config['infer_missing_saddles']:
             saddles = self.geo_validator.infer_missing_saddles(saddles, image)
+        
+        # Step 3b: Structure validation for each saddle
+        if self.structure_validator and self.config.get('use_structure_validation', False):
+            for saddle in saddles:
+                if saddle.crop is not None and saddle.crop.size > 0:
+                    saddle.structure = self.structure_validator.validate_structure(saddle.crop)
         
         # Step 4: Validate count
         if len(saddles) != self.config['expected_saddles']:
-            self._add_to_window(None)  # Invalid frame
+            self._add_to_window(None)
             return self._error_result(f"ERROR: {len(saddles)}/{self.config['expected_saddles']} saddles", 0.0, saddles, detected_count)
         
-        # Step 5: GEOMETRY VALIDATION - reject frames with invalid saddle geometry
+        # Step 5: GEOMETRY VALIDATION - RANSAC + physical constraints
         if self.config.get('use_geometry_validation', True):
             is_valid, reason = self.geo_validator.validate_geometry(saddles, self.geometry_tolerance)
             if not is_valid:
-                self._add_to_window(None)  # Geometry invalid
+                self._add_to_window(None)
                 return self._error_result(f"GEOMETRY: {reason}", 0.0, saddles, detected_count)
         
         alignment_status = "OK"
@@ -1220,7 +1371,15 @@ class AdvancedBlockInspector:
         
         # Step 8: Block decision (single frame)
         defective_count = sum(1 for r in saddle_results if r.status == 'DEFECTIVE')
-        frame_status = 'DEFECTIVE' if defective_count > 0 else 'PERFECT'
+        
+        # SANITY CHECK for live frame
+        avg_sim = np.mean([r.similarity_score for r in saddle_results]) if saddle_results else 0
+        if defective_count == self.config['expected_saddles'] and avg_sim < 0.86: # Increased from 0.82
+            frame_status = 'WASTE_IMAGE'
+        elif detected_count == 0:
+            frame_status = 'WASTE_IMAGE'
+        else:
+            frame_status = 'DEFECTIVE' if defective_count > 0 else 'PERFECT'
         
         # Step 9: SLIDING WINDOW CONSENSUS
         self._add_to_window(frame_status)

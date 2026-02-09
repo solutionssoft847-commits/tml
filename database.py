@@ -10,12 +10,29 @@ from sqlalchemy import Column, Integer, String, DateTime, Float, Text, select, u
 # Database Configuration
 # Render uses postgres://, SQLAlchemy requires postgresql+asyncpg://
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite+aiosqlite:///./inspector.db")
+
+# Automatically handle Render's postgres:// prefix
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
 elif DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
 
-engine = create_async_engine(DATABASE_URL, echo=False)
+# Optimized engine for Render/PostgreSQL
+# pool_size and max_overflow help manage connection limits on Render's free tier
+# pool_pre_ping=True ensures we don't use stale connections
+engine_args = {
+    "echo": False,
+    "pool_pre_ping": True,
+}
+
+if DATABASE_URL.startswith("postgresql"):
+    engine_args.update({
+        "pool_size": 5,
+        "max_overflow": 10,
+        "pool_recycle": 300,
+    })
+
+engine = create_async_engine(DATABASE_URL, **engine_args)
 AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 Base = declarative_base()
 
@@ -56,19 +73,40 @@ async def init_db():
         await conn.run_sync(Base.metadata.create_all)
     
     async with AsyncSessionLocal() as session:
-        # Initialize stats if not exists
+        # Initialize or Recalculate stats
         result = await session.execute(select(SystemStatsRecord).where(SystemStatsRecord.id == "stats"))
         stats = result.scalar_one_or_none()
+        
+        # Calculate actual counts from history (excluding waste)
+        from sqlalchemy import func
+        total = await session.execute(select(func.count(InspectionHistoryRecord.id)).where(InspectionHistoryRecord.status != 'WASTE_IMAGE'))
+        perfect = await session.execute(select(func.count(InspectionHistoryRecord.id)).where(InspectionHistoryRecord.status.in_(['PERFECT', 'PASS'])))
+        defective = await session.execute(select(func.count(InspectionHistoryRecord.id)).where(InspectionHistoryRecord.status.in_(['DEFECTIVE', 'FAIL'])))
+        
         if not stats:
-            stats = SystemStatsRecord(id="stats", total_scans=0, perfect_count=0, defected_count=0)
+            stats = SystemStatsRecord(
+                id="stats", 
+                total_scans=total.scalar() or 0, 
+                perfect_count=perfect.scalar() or 0, 
+                defected_count=defective.scalar() or 0
+            )
             session.add(stats)
-            await session.commit()
+        else:
+            stats.total_scans = total.scalar() or 0
+            stats.perfect_count = perfect.scalar() or 0
+            stats.defected_count = defective.scalar() or 0
+            
+        await session.commit()
     
-    print(" PostgreSQL connected and initialized via SQLAlchemy")
+    print(" PostgreSQL connected and database stats synchronized")
 
-class MongoDatabase: # Keeping the name to minimize changes in main.py, though it's now Postgres
+class MongoDatabase: 
     @staticmethod
     async def add_inspection_record(status, defects, image=None, processing_time=0):
+        # DO NOT PERSIST WASTE IMAGES
+        if str(status).upper() == "WASTE_IMAGE":
+            return {"id": "none", "status": "WASTE_IMAGE", "timestamp": datetime.now(timezone.utc).isoformat()}
+
         async with AsyncSessionLocal() as session:
             record = InspectionHistoryRecord(
                 status=status,
@@ -79,15 +117,16 @@ class MongoDatabase: # Keeping the name to minimize changes in main.py, though i
             )
             session.add(record)
             
-            # Update Stats
+            # Update Stats logic: Only count actual Present/Absent results
             result = await session.execute(select(SystemStatsRecord).where(SystemStatsRecord.id == "stats"))
             stats = result.scalar_one_or_none()
             if stats:
-                stats.total_scans += 1
                 if status.upper() in ["PERFECT", "PASS"]:
                     stats.perfect_count += 1
+                    stats.total_scans += 1
                 elif status.upper() in ["DEFECTIVE", "FAIL"]:
                     stats.defected_count += 1
+                    stats.total_scans += 1
                 session.add(stats)
             
             await session.commit()
@@ -119,7 +158,10 @@ class MongoDatabase: # Keeping the name to minimize changes in main.py, though i
     async def get_history(limit=50):
         async with AsyncSessionLocal() as session:
             result = await session.execute(
-                select(InspectionHistoryRecord).order_by(desc(InspectionHistoryRecord.id)).limit(limit)
+                select(InspectionHistoryRecord)
+                .where(InspectionHistoryRecord.status != 'WASTE_IMAGE')
+                .order_by(desc(InspectionHistoryRecord.id))
+                .limit(limit)
             )
             records = result.scalars().all()
             return [{
@@ -140,6 +182,7 @@ class MongoDatabase: # Keeping the name to minimize changes in main.py, though i
             result = await session.execute(
                 select(InspectionHistoryRecord)
                 .where(InspectionHistoryRecord.timestamp >= since)
+                .where(InspectionHistoryRecord.status != 'WASTE_IMAGE')
                 .order_by(desc(InspectionHistoryRecord.id))
                 .limit(limit)
             )

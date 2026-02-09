@@ -425,6 +425,10 @@ async def inspect_upload(file: UploadFile = File(...)):
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(executor, insp.inspect_block, image)
     
+    # UNWRAP WRAPPER (Gradio/Remote results often come as a tuple/list)
+    if isinstance(result, (tuple, list)):
+        result = result[0]
+        
     result_dict = result if isinstance(result, dict) else result.to_dict()
     block_status = result_dict.get('block_status', 'UNKNOWN')
     

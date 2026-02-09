@@ -83,6 +83,7 @@ class RemoteBlockInspector:
             print(f"✗ Failed to connect to HF Space {self.space_id}: {e}")
             self.client = None
     
+
     async def inspect_block_async(self, image: np.ndarray):
         """Async inspection - non-blocking"""
         if not self.client:
@@ -187,124 +188,8 @@ def get_inspector():
         raise RuntimeError("Inspector not initialized")
     return inspector
 
-# ==================== MULTIPROCESSING PIPELINE ====================
-# class FrameProcessor:
-#     def __init__(self):
-#         self.thread = None
-#         self.running = False
-#     
-#     def start(self):
-#         self.running = True
-#         self.thread = threading.Thread(target=self._process_loop, daemon=True)
-#         self.thread.start()
-#         print(" Frame processor started")
-#     
-#     def stop(self):
-#         self.running = False
-#         if self.thread:
-#             self.thread.join(timeout=2.0)
-#     
-#     def _process_loop(self):
-#         while self.running and processing_active.is_set():
-#             try:
-#                 frame = frame_queue.get(timeout=0.1)
-#                 start_time = time.time()
-#                 insp = get_inspector()
-#                 result = insp.inspect_live_frame(frame)
-#                 
-#                 if result is not None and result.block_status not in ['PENDING', 'WASTE_IMAGE']:
-#                     processing_time = (time.time() - start_time) * 1000
-#                     image_base64 = None
-#                     if hasattr(insp, 'visualize_results'):
-#                         try:
-#                             vis = insp.visualize_results(frame, insp.last_saddles, result.saddle_results)
-#                             _, buffer = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, 85])
-#                             img_str = base64.b64encode(buffer).decode('utf-8')
-#                             image_base64 = f"data:image/jpeg;base64,{img_str}"
-#                         except:
-#                             pass
-# 
-#                     result_data = {
-#                         'status': result.block_status,
-#                         'latency_ms': processing_time,
-#                         'defective_count': result.defective_saddles,
-#                         'timestamp': time.time(),
-#                         'result': result.to_dict(),
-#                         'image': image_base64
-#                     }
-#                     try:
-#                         result_queue.put_nowait(result_data)
-#                     except queue.Full:
-#                         try:
-#                             result_queue.get_nowait()
-#                             result_queue.put_nowait(result_data)
-#                         except: pass
-#                 frame_queue.task_done()
-#             except queue.Empty: continue
-#             except Exception as e:
-#                 print(f"✗ Frame processing error: {e}")
 
-# class AsyncResultBroadcaster:
-#     def __init__(self, manager):
-#         self.manager = manager
-#         self.task = None
-#         self.running = False
-#     
-#     def start(self):
-#         self.running = True
-#         self.task = asyncio.create_task(self._broadcast_loop())
-#         print(" Async Result Broadcaster started")
-#     
-#     def stop(self):
-#         self.running = False
-#     
-#     async def _broadcast_loop(self):
-#         while self.running and processing_active.is_set():
-#             try:
-#                 result_data = await asyncio.to_thread(result_queue.get, timeout=0.1)
-#                 record = await MongoDatabase.add_inspection_record(
-#                     status=result_data['status'],
-#                     defects=result_data['defective_count'],
-#                     image=result_data.get('image'),
-#                     processing_time=result_data['latency_ms']
-#                 )
-#                 result_data['id'] = record['id']
-#                 await self._async_broadcast(result_data)
-#                 result_queue.task_done()
-#             except (queue.Empty, asyncio.TimeoutError):
-#                 await asyncio.sleep(0.01)
-#             except Exception as e:
-#                 print(f"✗ Broadcast error: {e}")
-#                 await asyncio.sleep(1)
-#     
-#     async def _async_broadcast(self, result_data):
-#         try:
-#             await self.manager.broadcast({
-#                 "type": "live_status",
-#                 "data": {
-#                     "id": result_data.get('id'),
-#                     "status": result_data['status'],
-#                     "latency_ms": result_data['latency_ms'],
-#                     "image": result_data.get('image')
-#                 }
-#             })
-#             if result_data['status'] != 'PENDING':
-#                 await self.manager.broadcast({
-#                     "type": "history_update",
-#                     "data": [{
-#                         "id": result_data.get('id'),
-#                         "timestamp": datetime.now(timezone.utc).isoformat(),
-#                         "status": result_data['status'],
-#                         "defects": result_data['defective_count'],
-#                         "image": result_data.get('image'),
-#                         "processing_time": result_data['latency_ms']
-#                     }]
-#                 })
-#         except Exception as e:
-#             print(f"✗ WebSocket broadcast error: {e}")
-
-frame_processor = None
-result_broadcaster = None
+# ==================== MAIN APPLICATION ====================
 
 MAIN_LOOP = None
 
@@ -314,24 +199,8 @@ async def lifespan(app: FastAPI):
     MAIN_LOOP = asyncio.get_running_loop()
     await init_db()
     await init_inspector()
-    # frame_processor = FrameProcessor()
-    # frame_processor.start()
-    # result_broadcaster = AsyncResultBroadcaster(manager)
-    # result_broadcaster.start()
-    
-    # Auto-start default camera (0)
-    # try:
-    #     print("Attempting to auto-start Camera 0...")
-    #     await camera_manager.select_camera(0)
-    #     # if camera_manager.is_camera_active():
-    #     #     processing_active.set() # Trigger live inspection
-    # except Exception as e:
-    #     print(f"Auto-start camera failed: {e}")
-        
     yield
     processing_active.clear()
-    # if frame_processor: frame_processor.stop()
-    # if result_broadcaster: result_broadcaster.stop()
     release_camera()
     executor.shutdown(wait=True)
 
@@ -482,8 +351,8 @@ async def inspect_upload(file: UploadFile = File(...)):
     
     block_status = result_dict.get('block_status', 'UNKNOWN')
     
-    if block_status == 'WASTE_IMAGE':
-        return JSONResponse(status_code=400, content={"message": "Rejected: Image too dark or likely waste", "result": result_dict})
+    # Proceed with visualization/recording even if status is WASTE_IMAGE
+    # (The database already handles not persisting waste if desired)
 
     image_data = None
     if hasattr(insp, 'last_saddles'):

@@ -25,11 +25,19 @@ engine_args = {
     "pool_pre_ping": True,
 }
 
-if DATABASE_URL.startswith("postgresql"):
+if "postgresql" in DATABASE_URL:
+    # Render and most cloud providers require SSL
+    # asyncpg uses 'ssl' parameter
+    import ssl
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    
     engine_args.update({
-        "pool_size": 5,
-        "max_overflow": 10,
+        "pool_size": 2, # Reduced for free tier connection limits
+        "max_overflow": 5,
         "pool_recycle": 300,
+        "connect_args": {"ssl": ctx}
     })
 
 engine = create_async_engine(DATABASE_URL, **engine_args)

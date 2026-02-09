@@ -124,6 +124,28 @@ class RemoteBlockInspector:
     def inspect_block(self, image: np.ndarray):
         return asyncio.run(self.inspect_block_async(image))
 
+    # --- TEMPLATE MANAGEMENT (LOCAL FALLBACK) ---
+    def _get_local(self):
+        """Lazy load local inspector for template management features"""
+        if not hasattr(self, '_local_inspector') or self._local_inspector is None:
+            print(" 初始化本地检查器用于模板捕获 (Initialising local inspector for template capture)...")
+            from inspector_engine import AdvancedBlockInspector
+            self._local_inspector = AdvancedBlockInspector(yolo_model_path='yolo26n-obb.pt')
+        return self._local_inspector
+
+    def add_reference_image(self, image: np.ndarray):
+        return self._get_local().add_reference_image(image)
+    
+    def get_reference_count(self):
+        if not hasattr(self, '_local_inspector') or self._local_inspector is None:
+            return 0
+        return self._local_inspector.reference_manager.get_reference_count()
+
+    def get_reference_images(self):
+        if not hasattr(self, '_local_inspector') or self._local_inspector is None:
+            return []
+        return self._local_inspector.get_reference_images()
+
 # ==================== INSPECTOR INITIALIZATION ====================
 async def init_inspector():
     global inspector
@@ -432,16 +454,6 @@ async def add_reference(file: UploadFile = File(...)):
     if image is None: return JSONResponse(status_code=400, content={"message": "Invalid image"})
     
     insp = get_inspector()
-    
-    # Check if using remote inspector (which doesn't support adding references)
-    if isinstance(insp, RemoteBlockInspector):
-        return JSONResponse(
-            status_code=400, 
-            content={
-                "message": "Adding reference templates is not supported when using remote HuggingFace inspector. Please use a local inspector to add templates."
-            }
-        )
-    
     loop = asyncio.get_running_loop()
     success = await loop.run_in_executor(executor, insp.add_reference_image, image)
     
@@ -455,14 +467,11 @@ async def add_reference(file: UploadFile = File(...)):
         except Exception as e:
             print(f" ⚠ Failed to persist template: {e}")
             
-    return {"success": success, "count": insp.reference_manager.get_reference_count()}
+    return {"success": success, "count": insp.get_reference_count() if hasattr(insp, 'get_reference_count') else 0}
 
 @app.get("/api/templates")
 async def get_templates():
     insp = get_inspector()
-    # Remote inspector doesn't support template management
-    if isinstance(insp, RemoteBlockInspector):
-        return []
     if hasattr(insp, 'get_reference_images'):
         return insp.get_reference_images()
     return []

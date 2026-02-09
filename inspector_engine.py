@@ -611,7 +611,7 @@ class CNNFeatureExtractor:
         self.session = None
         self.model = None
         self.device = None
-        self.feature_dim = 512
+        self.feature_dim = 1024 # Custom fusion: L3(Avg+Max) + L4(Avg) = 256+256+512 = 1024
         self._initialized = False
     
     def _lazy_init(self):
@@ -620,6 +620,9 @@ class CNNFeatureExtractor:
             return
         self._initialized = True
         
+        # NOTE: Custom FeatureFusion (L3+L4) is currently only implemented in PyTorch.
+        # Disabling ONNX fallback to ensure 1024-dim features are extracted correctly.
+        """
         # Try ONNX first (faster on CPU)
         try:
             import onnxruntime as ort
@@ -638,8 +641,9 @@ class CNNFeatureExtractor:
             return
         except Exception as e:
             print(f"[WARN] ONNX failed: {e}, using PyTorch")
+        """
         
-        # Fallback to PyTorch
+        # Use fused PyTorch model
         self._init_pytorch_fallback()
     
     def _init_pytorch_fallback(self):
@@ -647,14 +651,50 @@ class CNNFeatureExtractor:
         torch = _get_torch()
         torchvision = _get_torchvision()
         from torchvision.models import resnet18, ResNet18_Weights
+        import torch.nn as nn
         
         self.device = torch.device('cpu')
         weights = ResNet18_Weights.IMAGENET1K_V1
-        model = resnet18(weights=weights)
-        self.model = torch.nn.Sequential(*list(model.children())[:-1])
+        base_model = resnet18(weights=weights)
+        
+        class FeatureFusionModel(nn.Module):
+            def __init__(self, base):
+                super().__init__()
+                self.conv1 = base.conv1
+                self.bn1 = base.bn1
+                self.relu = base.relu
+                self.maxpool = base.maxpool
+                self.layer1 = base.layer1
+                self.layer2 = base.layer2
+                self.layer3 = base.layer3
+                self.layer4 = base.layer4
+                self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+                self.maxpool_global = nn.AdaptiveMaxPool2d((1, 1))
+
+            def forward(self, x):
+                x = self.conv1(x)
+                x = self.bn1(x)
+                x = self.relu(x)
+                x = self.maxpool(x)
+                x = self.layer1(x)
+                x = self.layer2(x)
+                l3 = self.layer3(x)
+                l4 = self.layer4(l3)
+                
+                # Layer 3 features (Structural shape) - Avg + Max pool = 512-dim
+                f3_avg = self.avgpool(l3).view(l3.size(0), -1)
+                f3_max = self.maxpool_global(l3).view(l3.size(0), -1)
+                
+                # Layer 4 features (High-level identity) - Avg pool = 512-dim
+                f4_avg = self.avgpool(l4).view(l4.size(0), -1)
+                
+                # Total 1024-dim
+                return torch.cat([f3_avg, f3_max, f4_avg], dim=1)
+
+        self.model = FeatureFusionModel(base_model)
         self.model.to(self.device)
         self.model.eval()
-        print("[OK] PyTorch ResNet-18 fallback initialized")
+        print(f"[OK] PyTorch FeatureFusion ResNet-18 initialized (dim={self.feature_dim})")
     
     def _preprocess_image(self, image: np.ndarray) -> np.ndarray:
         """Preprocess a single image for inference"""

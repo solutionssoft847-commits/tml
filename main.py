@@ -430,7 +430,18 @@ async def add_reference(file: UploadFile = File(...)):
     nparr = np.frombuffer(contents, np.uint8)
     image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if image is None: return JSONResponse(status_code=400, content={"message": "Invalid image"})
+    
     insp = get_inspector()
+    
+    # Check if using remote inspector (which doesn't support adding references)
+    if isinstance(insp, RemoteBlockInspector):
+        return JSONResponse(
+            status_code=400, 
+            content={
+                "message": "Adding reference templates is not supported when using remote HuggingFace inspector. Please use a local inspector to add templates."
+            }
+        )
+    
     loop = asyncio.get_running_loop()
     success = await loop.run_in_executor(executor, insp.add_reference_image, image)
     
@@ -449,6 +460,9 @@ async def add_reference(file: UploadFile = File(...)):
 @app.get("/api/templates")
 async def get_templates():
     insp = get_inspector()
+    # Remote inspector doesn't support template management
+    if isinstance(insp, RemoteBlockInspector):
+        return []
     if hasattr(insp, 'get_reference_images'):
         return insp.get_reference_images()
     return []

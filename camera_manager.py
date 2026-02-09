@@ -18,7 +18,7 @@ except (ImportError, RuntimeError, Exception) as e:
 
 class QualityFilter:
     """Check image quality (blur detection + brightness)"""
-    def __init__(self, threshold: float = 120.0, min_brightness: float = 40.0):
+    def __init__(self, threshold: float = 80.0, min_brightness: float = 30.0):
         self.threshold = threshold
         self.min_brightness = min_brightness
     
@@ -258,21 +258,21 @@ class CameraManager:
         if frame is None:
             return None, False
             
-        # Motion Gating
-        motion_state = self.motion_gate.process(frame)
-        self.current_status = motion_state
+        # Motion Gating (DISABLED for Live Inspection Removal)
+        # motion_state = self.motion_gate.process(frame)
+        # self.current_status = motion_state
         
         should_capture = False
         
-        if motion_state == "READY":
-            # Motion stopped -> check quality
-            is_good, reason, score = self.quality_filter.check_quality(frame)
-            if is_good:
-                should_capture = True
-                print(f" [CAPTURE] Motion Stable ({self.motion_gate.stability_duration}s) & Sharp (Score: {score:.1f})")
-            else:
-                print(f" [SKIP] Stable but {reason} (Score: {score:.1f})")
-                
+        # if motion_state == "READY":
+        #     # Motion stopped -> check quality
+        #     is_good, reason, score = self.quality_filter.check_quality(frame)
+        #     if is_good:
+        #         should_capture = True
+        #         print(f" [CAPTURE] Motion Stable ({self.motion_gate.stability_duration}s) & Sharp (Score: {score:.1f})")
+        #     else:
+        #         print(f" [SKIP] Stable but {reason} (Score: {score:.1f})")
+        #         
         return frame, should_capture
 
     def test_connection(self, camera_id) -> bool:

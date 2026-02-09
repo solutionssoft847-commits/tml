@@ -1147,7 +1147,7 @@ class AdvancedBlockInspector:
             'use_sliding_window': True,
             'use_structure_validation': STRUCTURE_VALIDATOR_AVAILABLE,
             'use_optimized_validator': self.use_optimized_validator,
-            'min_brightness': 57.0, # Reject frames with mean brightness below this
+            'min_brightness': 42.0, # Reject frames with mean brightness below this
         }
         
         print("[OK] Advanced Inspector initialized (ONNX optimized)")
@@ -1275,12 +1275,14 @@ class AdvancedBlockInspector:
         
         # SANITY CHECK: If everything is defective and similarity is very low, it's WASTE/TRASH
         avg_sim = np.mean([r.similarity_score for r in saddle_results]) if saddle_results else 0
-        if defective_count == self.config['expected_saddles'] and avg_sim < 0.86: # Increased from 0.82
-             # print(f" [REJECT] Low similarity consensus ({avg_sim:.3f}) - likely WASTE")
+        if defective_count == self.config['expected_saddles'] and avg_sim < 0.70: # Relaxed from 0.86
              block_status = 'WASTE_IMAGE'
         elif detected_count == 0:
-             # If we didn't actually detect ANY circles and just inferred everything, it's TRASH
-             block_status = 'WASTE_IMAGE'
+             # Only reject as TRASH if we detected NOTHING and similarity is also low
+             if avg_sim < 0.75:
+                 block_status = 'WASTE_IMAGE'
+             else:
+                 block_status = 'DEFECTIVE'
         else:
              block_status = 'DEFECTIVE' if defective_count > 0 else 'PERFECT'
         
@@ -1301,191 +1303,194 @@ class AdvancedBlockInspector:
             block_angle=block_angle
         )
     
-    def inspect_live_frame(self, image: np.ndarray) -> Optional[BlockInspectionResult]:
-        """
-        Inspect a live video frame with OPTIMIZED validations:
-        1. Quality check (reject dark/waste images)
-        2. Frame skipping if YOLO fails
-        3. RANSAC collinearity + physical dimension validation
-        4. Semicircular surface + middle arc structure validation
-        5. Mesh-based inference for missing saddles
-        6. Sliding window consensus
-        
-        Returns:
-            BlockInspectionResult or None (if frame skipped)
-        """
-        start_time = time.time()
-        
-        # Step 0: Quality Check (Waste/Dark Image Rejection)
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        brightness = np.mean(gray)
-        if brightness < 40: # Increased threshold from 30 to 40
-            return BlockInspectionResult(
-                block_status='WASTE_IMAGE',
-                total_saddles=self.config.get('expected_saddles', 4),
-                detected_saddles=0,
-                defective_saddles=0,
-                saddle_results=[],
-                processing_time_ms=(time.time() - start_time) * 1000,
-                alignment_status='REJECTED_DARK',
-                block_angle=0.0
-            )
-
-        # Step 1: Try YOLO detection
-        saddles = []
-        if self.config['use_yolo']:
-            saddles = self.yolo_detector.detect_saddles(
-                image, conf_threshold=self.config['yolo_confidence']
-            )
-        
-        # Step 2: Frame skipping logic
-        if len(saddles) < self.config['expected_saddles']:
-            self.consecutive_failures += 1
-            
-            if self.consecutive_failures < self.max_skip_frames:
-                return None  # Skip frame
-            else:
-                saddles = self.geometric_detector.detect_saddles(image)
-                self.consecutive_failures = 0
-        else:
-            self.consecutive_failures = 0
-        
-        detected_count = len(saddles)
-        
-        # Step 3: OPTIMIZED - Validate and refine with structure + mesh inference
-        if self.use_optimized_validator and hasattr(self.geo_validator, 'validate_and_refine'):
-            saddles, refine_report = self.geo_validator.validate_and_refine(saddles, image)
-        elif len(saddles) < self.config['expected_saddles'] and self.config['infer_missing_saddles']:
-            saddles = self.geo_validator.infer_missing_saddles(saddles, image)
-        
-        # Step 3b: Structure validation for each saddle
-        if self.structure_validator and self.config.get('use_structure_validation', False):
-            for saddle in saddles:
-                if saddle.crop is not None and saddle.crop.size > 0:
-                    saddle.structure = self.structure_validator.validate_structure(saddle.crop)
-        
-        # Step 4: Validate count
-        if len(saddles) != self.config['expected_saddles']:
-            self._add_to_window(None)
-            return self._error_result(f"ERROR: {len(saddles)}/{self.config['expected_saddles']} saddles", 0.0, saddles, detected_count)
-        
-        # Step 5: GEOMETRY VALIDATION - RANSAC + physical constraints
-        if self.config.get('use_geometry_validation', True):
-            is_valid, reason = self.geo_validator.validate_geometry(saddles, self.geometry_tolerance)
-            if not is_valid:
-                self._add_to_window(None)
-                return self._error_result(f"GEOMETRY: {reason}", 0.0, saddles, detected_count)
-        
-        alignment_status = "OK"
-        block_angle = np.mean([s.angle for s in saddles])
-        
-        # Step 6: BATCH feature extraction
-        aligned_crops = [AlignmentCorrector.correct_saddle(s) for s in saddles]
-        batch_features = self.cnn_extractor.extract_batch(aligned_crops)
-        
-        # Step 7: Compare each saddle against references
-        saddle_results = []
-        for i, saddle in enumerate(saddles):
-            test_features = batch_features[i]
-            best_sim = 0.0
-            avg_dist = 999.0
-            
-            for ref in self.reference_manager.references:
-                if saddle.id < len(ref['features']):
-                    ref_features = ref['features'][saddle.id]
-                    sim = self.cnn_extractor.compute_similarity(test_features, ref_features)
-                    dist = np.linalg.norm(test_features - ref_features)
-                    if sim > best_sim:
-                        best_sim = sim
-                        avg_dist = dist
-            
-            status = 'PERFECT' if best_sim >= self.config['similarity_threshold'] else 'DEFECTIVE'
-            saddle_results.append(SaddleInspectionResult(
-                saddle_id=saddle.id,
-                status=status,
-                similarity_score=best_sim,
-                confidence=best_sim,
-                feature_distance=avg_dist,
-                detected=saddle.confidence > 0.0
-            ))
-        
-        # Step 8: Block decision (single frame)
-        defective_count = sum(1 for r in saddle_results if r.status == 'DEFECTIVE')
-        
-        # SANITY CHECK for live frame
-        avg_sim = np.mean([r.similarity_score for r in saddle_results]) if saddle_results else 0
-        if defective_count == self.config['expected_saddles'] and avg_sim < 0.86: # Increased from 0.82
-            frame_status = 'WASTE_IMAGE'
-        elif detected_count == 0:
-            frame_status = 'WASTE_IMAGE'
-        else:
-            frame_status = 'DEFECTIVE' if defective_count > 0 else 'PERFECT'
-        
-        # Step 9: SLIDING WINDOW CONSENSUS
-        self._add_to_window(frame_status)
-        
-        if self.config.get('use_sliding_window', True):
-            consensus = self._get_consensus()
-            if consensus is None:
-                # Not enough consistent frames - return result but mark as "PENDING"
-                block_status = 'PENDING'
-            else:
-                block_status = consensus
-        else:
-            block_status = frame_status
-        
-        processing_time = (time.time() - start_time) * 1000
-        
-        self.last_saddles = saddles
-        self.last_image = image
-        
-        return BlockInspectionResult(
-            block_status=block_status,
-            total_saddles=self.config['expected_saddles'],
-            detected_saddles=detected_count,
-            defective_saddles=defective_count,
-            saddle_results=saddle_results,
-            processing_time_ms=processing_time,
-            alignment_status=alignment_status,
-            block_angle=block_angle
-        )
-    
-    def _add_to_window(self, status: Optional[str]):
-        """Add result to sliding window"""
-        self.result_window.append(status)
-        if len(self.result_window) > self.window_size:
-            self.result_window.pop(0)
-    
-    def _get_consensus(self) -> Optional[str]:
-        """
-        Get consensus from sliding window.
-        
-        Rules:
-        - 5/5 PERFECT -> PERFECT
-        - 5/5 DEFECTIVE -> DEFECTIVE
-        - Mixed or contains None -> None (no consensus)
-        """
-        if len(self.result_window) < self.window_size:
-            return None  # Not enough data
-        
-        # Filter out None values
-        valid_results = [r for r in self.result_window if r is not None]
-        
-        if len(valid_results) < self.window_size:
-            return None  # Contains invalid frames
-        
-        # Check for unanimous decision
-        if all(r == 'PERFECT' for r in valid_results):
-            return 'PERFECT'
-        elif all(r == 'DEFECTIVE' for r in valid_results):
-            return 'DEFECTIVE'
-        else:
-            return None  # Mixed results - no consensus
-    
-    def reset_live_state(self):
-        """Reset live video state (call when switching to new block)"""
-        self.consecutive_failures = 0
-        self.result_window = []
+#     def inspect_live_frame(self, image: np.ndarray) -> Optional[BlockInspectionResult]:
+#         """
+#         Inspect a live video frame with OPTIMIZED validations:
+#         1. Quality check (reject dark/waste images)
+#         2. Frame skipping if YOLO fails
+#         3. RANSAC collinearity + physical dimension validation
+#         4. Semicircular surface + middle arc structure validation
+#         5. Mesh-based inference for missing saddles
+#         6. Sliding window consensus
+#         
+#         Returns:
+#             BlockInspectionResult or None (if frame skipped)
+#         """
+#         start_time = time.time()
+#         
+#         # Step 0: Quality Check (Waste/Dark Image Rejection)
+#         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+#         brightness = np.mean(gray)
+#         if brightness < 30: # Reduced from 40
+#             return BlockInspectionResult(
+#                 block_status='WASTE_IMAGE',
+#                 total_saddles=self.config.get('expected_saddles', 4),
+#                 detected_saddles=0,
+#                 defective_saddles=0,
+#                 saddle_results=[],
+#                 processing_time_ms=(time.time() - start_time) * 1000,
+#                 alignment_status='REJECTED_DARK',
+#                 block_angle=0.0
+#             )
+# 
+#         # Step 1: Try YOLO detection
+#         saddles = []
+#         if self.config['use_yolo']:
+#             saddles = self.yolo_detector.detect_saddles(
+#                 image, conf_threshold=self.config['yolo_confidence']
+#             )
+#         
+#         # Step 2: Frame skipping logic
+#         if len(saddles) < self.config['expected_saddles']:
+#             self.consecutive_failures += 1
+#             
+#             if self.consecutive_failures < self.max_skip_frames:
+#                 return None  # Skip frame
+#             else:
+#                 saddles = self.geometric_detector.detect_saddles(image)
+#                 self.consecutive_failures = 0
+#         else:
+#             self.consecutive_failures = 0
+#         
+#         detected_count = len(saddles)
+#         
+#         # Step 3: OPTIMIZED - Validate and refine with structure + mesh inference
+#         if self.use_optimized_validator and hasattr(self.geo_validator, 'validate_and_refine'):
+#             saddles, refine_report = self.geo_validator.validate_and_refine(saddles, image)
+#         elif len(saddles) < self.config['expected_saddles'] and self.config['infer_missing_saddles']:
+#             saddles = self.geo_validator.infer_missing_saddles(saddles, image)
+#         
+#         # Step 3b: Structure validation for each saddle
+#         if self.structure_validator and self.config.get('use_structure_validation', False):
+#             for saddle in saddles:
+#                 if saddle.crop is not None and saddle.crop.size > 0:
+#                     saddle.structure = self.structure_validator.validate_structure(saddle.crop)
+#         
+#         # Step 4: Validate count
+#         if len(saddles) != self.config['expected_saddles']:
+#             self._add_to_window(None)
+#             return self._error_result(f"ERROR: {len(saddles)}/{self.config['expected_saddles']} saddles", 0.0, saddles, detected_count)
+#         
+#         # Step 5: GEOMETRY VALIDATION - RANSAC + physical constraints
+#         if self.config.get('use_geometry_validation', True):
+#             is_valid, reason = self.geo_validator.validate_geometry(saddles, self.geometry_tolerance)
+#             if not is_valid:
+#                 self._add_to_window(None)
+#                 return self._error_result(f"GEOMETRY: {reason}", 0.0, saddles, detected_count)
+#         
+#         alignment_status = "OK"
+#         block_angle = np.mean([s.angle for s in saddles])
+#         
+#         # Step 6: BATCH feature extraction
+#         aligned_crops = [AlignmentCorrector.correct_saddle(s) for s in saddles]
+#         batch_features = self.cnn_extractor.extract_batch(aligned_crops)
+#         
+#         # Step 7: Compare each saddle against references
+#         saddle_results = []
+#         for i, saddle in enumerate(saddles):
+#             test_features = batch_features[i]
+#             best_sim = 0.0
+#             avg_dist = 999.0
+#             
+#             for ref in self.reference_manager.references:
+#                 if saddle.id < len(ref['features']):
+#                     ref_features = ref['features'][saddle.id]
+#                     sim = self.cnn_extractor.compute_similarity(test_features, ref_features)
+#                     dist = np.linalg.norm(test_features - ref_features)
+#                     if sim > best_sim:
+#                         best_sim = sim
+#                         avg_dist = dist
+#             
+#             status = 'PERFECT' if best_sim >= self.config['similarity_threshold'] else 'DEFECTIVE'
+#             saddle_results.append(SaddleInspectionResult(
+#                 saddle_id=saddle.id,
+#                 status=status,
+#                 similarity_score=best_sim,
+#                 confidence=best_sim,
+#                 feature_distance=avg_dist,
+#                 detected=saddle.confidence > 0.0
+#             ))
+#         
+#         # Step 8: Block decision (single frame)
+#         defective_count = sum(1 for r in saddle_results if r.status == 'DEFECTIVE')
+#         
+#         # SANITY CHECK for live frame
+#         avg_sim = np.mean([r.similarity_score for r in saddle_results]) if saddle_results else 0
+#         if defective_count == self.config['expected_saddles'] and avg_sim < 0.70: # Relaxed from 0.86
+#             frame_status = 'WASTE_IMAGE'
+#         elif detected_count == 0:
+#             if avg_sim < 0.75:
+#                 frame_status = 'WASTE_IMAGE'
+#             else:
+#                 frame_status = 'DEFECTIVE'
+#         else:
+#             frame_status = 'DEFECTIVE' if defective_count > 0 else 'PERFECT'
+#         
+#         # Step 9: SLIDING WINDOW CONSENSUS
+#         self._add_to_window(frame_status)
+#         
+#         if self.config.get('use_sliding_window', True):
+#             consensus = self._get_consensus()
+#             if consensus is None:
+#                 # Not enough consistent frames - return result but mark as "PENDING"
+#                 block_status = 'PENDING'
+#             else:
+#                 block_status = consensus
+#         else:
+#             block_status = frame_status
+#         
+#         processing_time = (time.time() - start_time) * 1000
+#         
+#         self.last_saddles = saddles
+#         self.last_image = image
+#         
+#         return BlockInspectionResult(
+#             block_status=block_status,
+#             total_saddles=self.config['expected_saddles'],
+#             detected_saddles=detected_count,
+#             defective_saddles=defective_count,
+#             saddle_results=saddle_results,
+#             processing_time_ms=processing_time,
+#             alignment_status=alignment_status,
+#             block_angle=block_angle
+#         )
+#     
+#     def _add_to_window(self, status: Optional[str]):
+#         """Add result to sliding window"""
+#         self.result_window.append(status)
+#         if len(self.result_window) > self.window_size:
+#             self.result_window.pop(0)
+#     
+#     def _get_consensus(self) -> Optional[str]:
+#         """
+#         Get consensus from sliding window.
+#         
+#         Rules:
+#         - 5/5 PERFECT -> PERFECT
+#         - 5/5 DEFECTIVE -> DEFECTIVE
+#         - Mixed or contains None -> None (no consensus)
+#         """
+#         if len(self.result_window) < self.window_size:
+#             return None  # Not enough data
+#         
+#         # Filter out None values
+#         valid_results = [r for r in self.result_window if r is not None]
+#         
+#         if len(valid_results) < self.window_size:
+#             return None  # Contains invalid frames
+#         
+#         # Check for unanimous decision
+#         if all(r == 'PERFECT' for r in valid_results):
+#             return 'PERFECT'
+#         elif all(r == 'DEFECTIVE' for r in valid_results):
+#             return 'DEFECTIVE'
+#         else:
+#             return None  # Mixed results - no consensus
+#     
+#     def reset_live_state(self):
+#         """Reset live video state (call when switching to new block)"""
+#         self.consecutive_failures = 0
+#         self.result_window = []
 
     def get_reference_images(self) -> List[str]:
         """Return list of reference images from manager"""

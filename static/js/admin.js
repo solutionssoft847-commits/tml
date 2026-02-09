@@ -977,10 +977,34 @@ function initModals() {
     const openBtn = document.getElementById('open-scan-modal');
     const closeBtns = document.querySelectorAll('.close-modal');
 
-    if (openBtn) openBtn.onclick = () => modal.classList.add('active');
-    closeBtns.forEach(btn => btn.onclick = () => modal.classList.remove('active'));
+    if (openBtn) {
+        openBtn.onclick = () => {
+            modal.classList.add('active');
 
-    window.onclick = (e) => { if (e.target === modal) modal.classList.remove('active'); };
+            // On Render/Cloud, don't auto-start USB camera 0 (it will fail)
+            const isRender = window.location.hostname.includes('onrender.com');
+            if (!isRender) {
+                console.log('Local environment detected, auto-starting USB camera 0');
+                selectCamera(0).catch(e => console.warn('USB 0 not available'));
+            } else {
+                console.log('Cloud environment detected, skipping USB auto-start');
+            }
+        };
+    }
+    closeBtns.forEach(btn => {
+        btn.onclick = () => {
+            modal.classList.remove('active');
+            // Stop camera when scan modal closes to save resources
+            stopInspection();
+        };
+    });
+
+    window.onclick = (e) => {
+        if (e.target === modal) {
+            modal.classList.remove('active');
+            stopInspection();
+        }
+    };
 
     // Tab buttons
     const tabBtns = document.querySelectorAll('.tab-btn');

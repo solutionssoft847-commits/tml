@@ -263,3 +263,14 @@ class MongoDatabase:
             await session.execute(delete(TemplateRecord))
             await session.commit()
             return True
+    @staticmethod
+    async def check_connection():
+        """Verify if the database is reachable"""
+        try:
+            async with AsyncSessionLocal() as session:
+                from sqlalchemy import text
+                await session.execute(text("SELECT 1"))
+                return True
+        except Exception as e:
+            print(f"DEBUG: Database connection check failed: {e}")
+            return False

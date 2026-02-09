@@ -190,7 +190,7 @@ class FrameProcessor:
                 insp = get_inspector()
                 result = insp.inspect_live_frame(frame)
                 
-                if result is not None and result.block_status != 'PENDING':
+                if result is not None and result.block_status not in ['PENDING', 'WASTE_IMAGE']:
                     processing_time = (time.time() - start_time) * 1000
                     image_base64 = None
                     if hasattr(insp, 'visualize_results'):
@@ -398,6 +398,9 @@ async def inspect_upload(file: UploadFile = File(...)):
     result_dict = result if isinstance(result, dict) else result.to_dict()
     block_status = result_dict.get('block_status', 'UNKNOWN')
     
+    if block_status == 'WASTE_IMAGE':
+        return JSONResponse(status_code=400, content={"message": "Rejected: Image too dark or likely waste", "result": result_dict})
+
     image_data = None
     if hasattr(insp, 'last_saddles'):
         vis = insp.visualize_results(image, insp.last_saddles, result.saddle_results)
@@ -644,5 +647,5 @@ def release_camera():
     camera_manager.release_camera()
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8001))
+    port = int(os.environ.get("PORT", 8002))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False, workers=1)

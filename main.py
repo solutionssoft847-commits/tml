@@ -425,18 +425,43 @@ async def inspect_upload(file: UploadFile = File(...)):
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(executor, insp.inspect_block, image)
     
-    # ROBUST RESULT HANDLING (Gradio/Remote results can be JSON strings, tuples, or objects)
-    if isinstance(result, (tuple, list)) and len(result) > 0:
-        result = result[0]
+    # ROBUST RESULT HANDLING (Gradio/Remote results can be [image_path, json_data])
+    debug_result = result
     
+    if isinstance(result, (tuple, list)):
+        # Search for a dictionary or a JSON string in the list
+        found_data = None
+        for item in result:
+            if isinstance(item, dict) and 'block_status' in item:
+                found_data = item
+                break
+            if isinstance(item, str):
+                try:
+                    import json
+                    parsed = json.loads(item)
+                    if isinstance(parsed, dict) and 'block_status' in parsed:
+                        found_data = parsed
+                        break
+                except:
+                    continue
+        
+        # If we found a valid data bit, use it. Otherwise fallback to first item
+        if found_data:
+            result = found_data
+        elif len(result) > 0:
+            result = result[0]
+
     if isinstance(result, str):
         try:
             import json
             result = json.loads(result)
         except:
-            print(f"  ⚠ Result is string but not valid JSON: {result[:100]}...")
-            # Fallback if it's a simple status string
-            result = {"block_status": result if result else "UNKNOWN"}
+            if "/tmp/gradio" in result or result.endswith(('.webp', '.jpg', '.png')):
+                print(f"  ⚠ Caught file path instead of data: {result}")
+                # Try to find data in the OTHER parts of the debug_result if it was a list
+                result = {"block_status": "ERROR", "message": "HF Space returned image path but no data found"}
+            else:
+                result = {"block_status": result if result else "UNKNOWN"}
 
     # Final conversion to dict
     if isinstance(result, dict):
@@ -444,7 +469,7 @@ async def inspect_upload(file: UploadFile = File(...)):
     elif hasattr(result, 'to_dict'):
         result_dict = result.to_dict()
     else:
-        result_dict = {"block_status": "ERROR", "message": "Invalid result type from inspector"}
+        result_dict = {"block_status": "ERROR", "message": f"Invalid result type: {type(result)}"}
     
     block_status = result_dict.get('block_status', 'UNKNOWN')
     
